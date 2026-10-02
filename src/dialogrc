@@ -1,0 +1,9 @@
+# secpanel dialog color theme
+# Purpose: highlight the --inputbox field (white on blue bar) only while it has focus.
+#       When the cursor moves to a button, dialog turns the field plain again,
+#       so, like the active button, it is obvious which element is active.
+# Everything else uses the dialog defaults.
+
+inputbox_color = (WHITE,BLUE,ON)
+inputbox_border_color = (WHITE,BLUE,ON)
+inputbox_border2_color = (WHITE,BLUE,ON)

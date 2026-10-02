@@ -1,0 +1,2403 @@
+#!/usr/bin/env bash
+#
+# secpanel - Firewall / SELinux / lockout guard / backup TUI
+#
+# RHEL / Rocky / AlmaLinux 9.
+# Built on dialog. English / Korean UI (Language menu or SECPANEL_LANG=en|ko). English by default.
+#
+# Depends on: dialog, firewalld(firewall-cmd), policycoreutils,
+#         policycoreutils-python-utils(semanage/audit2allow), setools-console
+#
+set -o pipefail
+
+APP_NAME="secpanel"
+APP_VERSION="2.12.0"
+
+# ---------------------------------------------------------------------------
+# Language (i18n)
+# ---------------------------------------------------------------------------
+LANG_FILE="/etc/secpanel/lang"
+LANG_MODE="en"
+
+# Optional defaults file shipped by a package. key=value format.
+#   UI_LANG=ko|en            UI language on first run
+#   DB_HOME / DB_DIR / ...   defaults for the backup settings (same keys as backup.conf)
+# Values the user changed in the menu (/etc/secpanel/) always win.
+VENDOR_DEFAULTS="/usr/share/secpanel/defaults.conf"
+vendor_default() {  # $1=key -> value (empty if not set)
+    [[ -r "$VENDOR_DEFAULTS" ]] || return 0
+    local k v
+    while IFS='=' read -r k v; do
+        [[ "$k" == "$1" ]] && { printf '%s' "$v"; return 0; }
+    done <"$VENDOR_DEFAULTS"
+    return 0
+}
+
+# Priority: env SECPANEL_LANG > value chosen in the menu (/etc/secpanel/lang) > package default > English
+detect_lang() {
+    local l="${SECPANEL_LANG:-}"
+    [[ -z "$l" && -r "$LANG_FILE" ]] && l="$(cat "$LANG_FILE" 2>/dev/null)"
+    [[ -z "$l" ]] && l="$(vendor_default UI_LANG)"
+    case "$l" in ko|KO|korean) LANG_MODE="ko" ;; *) LANG_MODE="en" ;; esac
+}
+save_lang() {
+    mkdir -p "$(dirname "$LANG_FILE")" 2>/dev/null
+    printf '%s\n' "$LANG_MODE" > "$LANG_FILE" 2>/dev/null
+    export SECPANEL_LANG="$LANG_MODE"   # child tools (secpanel-guard) use the same language
+}
+# L "<korean>" "<english>"  - return the string for the current language
+L() { if [[ "$LANG_MODE" == "en" ]]; then printf '%s' "$2"; else printf '%s' "$1"; fi; }
+
+detect_lang
+export SECPANEL_LANG="$LANG_MODE"   # pass the language to child processes such as secpanel-guard
+BACKTITLE="secpanel ${APP_VERSION} — $(L '방화벽·SELinux·작업 안전장치·백업' 'Firewall·SELinux·Guard·Backup')"
+
+# default dialog window size
+DLG_H=22
+DLG_W=76
+MENU_H=12
+
+# color theme that shows the input field in reverse video (used if present)
+for _rc in /usr/share/secpanel/dialogrc "$(dirname "$0")/dialogrc"; do
+    [[ -f "$_rc" ]] && { export DIALOGRC="$_rc"; break; }
+done
+
+# Temporary files
+# root-only (700) temp directory - derived files (.avc etc.) are safe from /tmp symlink attacks
+TMP_DIR="$(mktemp -d /tmp/secpanel.XXXXXX)"
+TMP_OUT="$TMP_DIR/out"
+: >"$TMP_OUT"
+EXIT_NOTE=""      # note to leave on the terminal after exit (only if set)
+GOT_INT=0         # whether Ctrl+C was received
+TICKER_PID=""     # background process that shows the guard countdown
+cleanup() {
+    [[ -n "$TICKER_PID" ]] && kill "$TICKER_PID" 2>/dev/null
+    rm -rf "$TMP_DIR"
+    [[ -t 1 ]] && clear 2>/dev/null
+    [[ -n "$EXIT_NOTE" ]] && echo "$EXIT_NOTE" >&2
+    return 0
+}
+# Clean up only once, at exit. (Cleaning up on Ctrl+C used to delete the temp directory while
+# the program kept running, which broke the result screens.) Ctrl+C only means "back one level", like ESC.
+trap cleanup EXIT
+trap 'GOT_INT=1' INT
+trap 'exit 143' TERM HUP
+
+# Make dialog return ESC with a code different from a screen error (255), so the main menu can tell them apart
+export DIALOG_ESC=27
+
+# ---------------------------------------------------------------------------
+# Common helpers
+# ---------------------------------------------------------------------------
+die() { echo "$(L '오류' 'Error'): $*" >&2; exit 1; }
+
+need_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "$(L "이 도구는 root 권한이 필요합니다. 'sudo secpanel' 로 실행하세요." \
+                "This tool requires root. Run 'sudo secpanel'.")" >&2
+        exit 1
+    fi
+}
+
+need_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# Drop keys typed while the screen is changing, so they are not applied to a screen that is
+# not visible yet (running the wrong item with Enter, or closing it with ESC)
+flush_input() {
+    local _k
+    while read -r -s -n 1 -t 0.01 _k </dev/tty 2>/dev/null; do :; done
+    return 0
+}
+
+# Wrapper that returns the dialog result on stdout. OK/Cancel/Back labels follow the language.
+dlg() {
+    flush_input
+    dialog --backtitle "$BACKTITLE" \
+        --ok-label "$(L '확인' 'OK')" --cancel-label "$(L '취소' 'Cancel')" "$@" 3>&1 1>&2 2>&3
+}
+
+# Free-text input. Uses whiptail (libnewt) so the arrow keys move between elements, like nmtui.
+# Up/Down moves between the field, OK and Cancel; the active element is highlighted,
+# Enter activates it. (dialog cannot move with the arrow keys, so only input boxes use whiptail)
+dlg_input() {
+    local title="$1" prompt="$2" def="${3:-}"
+    local hint="$(L '[ ↑↓ 로 입력칸/확인/취소 이동, Enter 로 실행 ]' \
+                    '[ Use up/down to move between field/OK/Cancel, Enter to activate ]')"
+    # unlike dialog, whiptail does not interpret \n, so convert it to real line breaks
+    local text="${prompt}"$'\n\n'"${hint}"
+    text="${text//'\n'/$'\n'}"
+    flush_input
+    whiptail --title "$title" \
+        --ok-button "$(L '확인' 'OK')" --cancel-button "$(L '취소' 'Cancel')" \
+        --inputbox "$text" 13 "$DLG_W" "$def" \
+        3>&1 1>&2 2>&3
+}
+
+# --cr-wrap: keep line breaks of command output / --no-collapse: keep alignment spaces
+msg()  { flush_input; dialog --backtitle "$BACKTITLE" --ok-label "$(L '확인' 'OK')" --title "$1" --cr-wrap --no-collapse --msgbox "$2" "${3:-$DLG_H}" "${4:-$DLG_W}"; }
+yesno(){ flush_input; dialog --backtitle "$BACKTITLE" --yes-label "$(L '예' 'Yes')" --no-label "$(L '아니오' 'No')" --title "$1" --yesno "$2" "${3:-10}" "${4:-$DLG_W}"; }
+
+# Run a command and show success / failure in a dialog.
+run_show() {
+    local title="$1"; shift
+    if "$@" >"$TMP_OUT" 2>&1; then
+        msg "$title — $(L '성공' 'OK')" "$(L '명령이 정상 실행되었습니다.' 'Command completed successfully.')\n\n\$ $*\n\n$(cat "$TMP_OUT")"
+        return 0
+    else
+        msg "$title — $(L '실패' 'Failed')" "$(L '명령 실행에 실패했습니다.' 'Command failed.')\n\n\$ $*\n\n$(cat "$TMP_OUT")"
+        return 1
+    fi
+}
+
+# Show long output in a scrolling window. Long lines are wrapped to the window width
+# (fold -s: break at word boundaries, so you only scroll up and down, never sideways)
+show_text() {
+    local title="$1"; shift
+    "$@" 2>&1 | fold -s -w "$((DLG_W-6))" >"$TMP_OUT"
+    flush_input
+    dialog --backtitle "$BACKTITLE" --exit-label "$(L '닫기' 'Close')" --title "$title" \
+        --textbox "$TMP_OUT" "$DLG_H" "$DLG_W"
+}
+
+# ---------------------------------------------------------------------------
+# Guard countdown - right side of the top line (22 columns)
+#   While armed, "Rollback in 04:32" is refreshed every second. Red background for the last 60 seconds.
+#   After a rollback, "Rolled back HH:MM:SS" is shown on green for 10 minutes.
+#   The cursor is saved / restored (ESC 7 / ESC 8) and only that spot is overwritten, so the menu is untouched.
+# ---------------------------------------------------------------------------
+GUARD_ACTIVE="/var/lib/secpanel-guard/active"
+GUARD_TXT=""; GUARD_COLOR=""
+guard_ticker_text() {
+    local now at to left rb
+    GUARD_TXT=""; GUARD_COLOR='1;33;44'
+    [[ -f "$GUARD_ACTIVE/armed_at" && -f "$GUARD_ACTIVE/timeout" && ! -f "$GUARD_ACTIVE/confirmed" ]] || return 0
+    printf -v now '%(%s)T' -1
+    if [[ -f "$GUARD_ACTIVE/rolled_back" ]]; then
+        rb="$(<"$GUARD_ACTIVE/rolled_back")"
+        if [[ "$rb" =~ ^[0-9]+$ ]] && (( now - rb < 600 )); then
+            printf -v GUARD_TXT ' %s %(%H:%M:%S)T ' "$(L '원복 완료' 'Rolled back')" "$rb"; GUARD_COLOR='1;37;42'
+        fi
+        return 0
+    fi
+    at="$(<"$GUARD_ACTIVE/armed_at")"; to="$(<"$GUARD_ACTIVE/timeout")"
+    [[ "$at" =~ ^[0-9]+$ && "$to" =~ ^[0-9]+$ ]] || return 0
+    left=$(( at + to - now ))
+    if (( left > 0 )); then
+        printf -v GUARD_TXT ' %s %02d:%02d ' "$(L '자동 원복까지' 'Rollback in')" $(( left / 60 )) $(( left % 60 ))
+        (( left <= 60 )) && GUARD_COLOR='1;37;41'
+    elif (( left > -120 )); then
+        GUARD_TXT=" $(L '자동 원복 중...' 'Rolling back...') "; GUARD_COLOR='1;37;41'
+    fi
+    return 0
+}
+guard_ticker() {
+    local last="" cols w pad col
+    trap '' INT
+    while kill -0 $$ 2>/dev/null; do
+        guard_ticker_text
+        if [[ -n "$GUARD_TXT" || -n "$last" ]]; then
+            cols="$(stty size </dev/tty 2>/dev/null)"; cols="${cols##* }"
+            [[ "$cols" =~ ^[0-9]+$ ]] || cols=80
+            w="${GUARD_TXT//[[:ascii:]]/}"; w=$(( ${#GUARD_TXT} + ${#w} ))   # Hangul takes 2 columns
+            pad=$(( 22 - w )); (( pad < 0 )) && pad=0
+            col=$(( cols - 21 )); (( col < 1 )) && col=1
+            printf '\0337\033[1;%dH\033[0;44m%*s\033[%sm%s\0338' "$col" "$pad" '' "$GUARD_COLOR" "$GUARD_TXT" >/dev/tty 2>/dev/null
+        fi
+        last="$GUARD_TXT"
+        sleep 1
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Preflight checks
+# ---------------------------------------------------------------------------
+preflight() {
+    need_cmd dialog || die "$(L "'dialog' 가 설치되어 있지 않습니다. (dnf install dialog)" \
+                              "'dialog' is not installed. (dnf install dialog)")"
+    local missing=()
+    need_cmd firewall-cmd || missing+=("firewalld")
+    need_cmd getenforce   || missing+=("libselinux-utils")
+    need_cmd semanage     || missing+=("policycoreutils-python-utils")
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        msg "$(L '구성요소 확인' 'Component check')" \
+            "$(L '다음 패키지가 없어 일부 기능이 제한될 수 있습니다:' 'Some features may be limited; missing packages:')\n\n  ${missing[*]}\n\n$(L '설치' 'Install'):\n  dnf install ${missing[*]}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Firewall (firewalld)
+# ---------------------------------------------------------------------------
+fw_default_zone() { firewall-cmd --get-default-zone 2>/dev/null; }
+fw_running() { firewall-cmd --state >/dev/null 2>&1; }
+
+fw_pick_zone() {
+    local zones dz z
+    dz="$(fw_default_zone)"
+    zones="$(firewall-cmd --get-zones 2>/dev/null)"
+    # public (the usual default zone) first, the rest after it
+    local ordered
+    ordered="$(printf '%s\n' $zones | grep -x public; printf '%s\n' $zones | grep -vx public)"
+    local args=()
+    for z in $ordered; do
+        if [[ "$z" == "$dz" ]]; then
+            args+=("$z" "$(L '기본 존 (default)' 'default zone')")
+        else
+            args+=("$z" " ")
+        fi
+    done
+    dlg --title "$(L '존(zone) 선택' 'Select zone')" --default-item "$dz" \
+        --menu "$(L '정책을 적용할 방화벽 존을 선택하세요.\n(잘 모르면 기본 존을 그대로 선택)' \
+                   'Select the firewall zone to apply to.\n(If unsure, keep the default zone)')" \
+        18 "$DLG_W" "$MENU_H" "${args[@]}"
+}
+
+fw_overview() {
+    {
+        echo "===================================================================="
+        echo " $(L '방화벽(firewalld) 현재 상태 요약' 'firewalld — current status summary')"
+        echo "===================================================================="
+        echo
+        echo "[ $(L '서비스 상태' 'Service state') ]"
+        firewall-cmd --state 2>&1
+        echo
+        echo "[ $(L '기본 존' 'Default zone') ]  $(fw_default_zone)"
+        echo "[ $(L '활성 존' 'Active zones') ]"
+        firewall-cmd --get-active-zones 2>&1
+        echo
+        echo "===================================================================="
+        echo " $(L '각 존별 상세 정책 (public 우선)' 'Per-zone details (public first)')"
+        echo "===================================================================="
+        local _zl z
+        _zl="$(firewall-cmd --get-zones 2>/dev/null)"
+        for z in $(printf '%s\n' $_zl | grep -x public; printf '%s\n' $_zl | grep -vx public); do
+            echo "──────────────── zone: $z ────────────────"
+            firewall-cmd --zone="$z" --list-all 2>&1
+            echo
+        done
+    } | fold -s -w "$((DLG_W-6))" >"$TMP_OUT"
+    flush_input
+    dialog --backtitle "$BACKTITLE" --exit-label "$(L '닫기' 'Close')" \
+        --title "$(L '방화벽 정책 한눈에 보기' 'Firewall policy overview')" \
+        --textbox "$TMP_OUT" "$DLG_H" "$DLG_W"
+}
+
+# --- input validation ---
+valid_port()   { [[ "$1" =~ ^[0-9]{1,5}(-[0-9]{1,5})?$ ]]; }
+valid_ipcidr() { [[ "$1" =~ ^[0-9A-Fa-f:.]+(/[0-9]{1,3})?$ ]]; }
+
+# --- warning before a change that can cut the remote session ---
+guard_armed() { systemctl is-active --quiet secpanel-guard.timer 2>/dev/null; }
+
+# ports SSH listens on (from the sshd configuration, there can be several)
+remote_access_ports() {
+    local p
+    p="$(sshd -T 2>/dev/null | awk '/^port /{print $2}')"
+    echo "${p:-22}"
+}
+
+# returns 0 if a port string (e.g. 22/tcp, 20-30/tcp) includes a remote access port
+port_hits_remote() {
+    local spec="${1%%/*}" lo hi rp
+    lo="${spec%%-*}"; hi="${spec##*-}"
+    for rp in $(remote_access_ports); do
+        [[ "$rp" =~ ^[0-9]+$ ]] || continue
+        (( rp >= lo && rp <= hi )) && return 0
+    done
+    return 1
+}
+
+# lockout_check "<what is about to be done>"
+#   If the guard is off: choose [arm the guard and continue / just continue / cancel].
+#   Returns 0 to continue, 1 to cancel.
+lockout_check() {
+    local what="$1" sel
+    guard_armed && return 0
+    need_cmd secpanel-guard || return 0
+    sel="$(dlg --title "$(L '[주의] 원격 접속이 끊길 수 있는 작업' '[CAUTION] This may cut remote access')" \
+        --cancel-label "$(L '취소' 'Cancel')" --menu \
+        "$(L "지금 하려는 작업:" "About to:") $what\n\n$(L "잘못되면 SSH 접속이 끊겨 서버에 다시 못 들어올 수 있습니다.\n작업 안전장치를 켜두면, 5분 안에 '확정'하지 않을 경우\n방화벽이 자동으로 원래대로 돌아옵니다." \
+             "If this goes wrong you may lose SSH access to the server.\nWith the lockout guard armed, the firewall reverts\nautomatically unless you confirm within 5 minutes.")" \
+        15 "$DLG_W" 2 \
+        arm  "$(L '안전장치 켜고 진행 (권장)' 'Arm the guard, then proceed (recommended)')" \
+        skip "$(L '안전장치 없이 그냥 진행' 'Proceed without the guard')")" || return 1
+    if [[ "$sel" == "arm" ]]; then
+        if secpanel-guard arm --timeout 300 --targets firewall --note "secpanel: $what" >"$TMP_OUT" 2>&1; then
+            msg "$(L '안전장치 켜짐' 'Guard armed')" \
+                "$(L "안전장치가 켜졌습니다 (5분).\n\n작업 후 새 SSH 창으로 접속이 되는지 확인하고,\n메인 메뉴 → 작업 안전장치 → '확정(ok)' 을 누르세요.\n확정하지 않으면 5분 뒤 자동으로 원래대로 돌아갑니다." \
+                     "The guard is armed (5 minutes).\n\nAfter the change, open a NEW SSH window to check access, then\nMain menu → Lockout guard → 'Confirm (ok)'.\nIf not confirmed, it reverts automatically after 5 minutes.")" 14
+        else
+            msg "$(L '안전장치 켜기 실패' 'Guard arm failed')" "$(L '안전장치를 켜지 못해 작업을 중단합니다.' 'Could not arm the guard; aborting.')\n\n$(cat "$TMP_OUT")"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+fw_add_port() {
+    local zone port proto
+    zone="$(fw_pick_zone)" || return
+    port="$(dlg_input "$(L '포트 추가' 'Add port')" \
+        "$(L '열고 싶은 포트 번호를 입력하세요.\n예) 8080  또는  8000-8100 (범위)' \
+             'Enter the port to open.\ne.g. 8080  or  8000-8100 (range)')")" || return
+    [[ -z "$port" ]] && { msg "$(L '포트 추가' 'Add port')" "$(L '포트 번호가 비어 있습니다.' 'Port is empty.')"; return; }
+    valid_port "$port" || { msg "$(L '포트 추가' 'Add port')" "$(L "'$port' 는 올바른 포트가 아닙니다.\n숫자(예: 8080) 또는 범위(예: 8000-8100)로 입력하세요." "'$port' is not a valid port.\nUse a number (e.g. 8080) or a range (e.g. 8000-8100).")" 10; return; }
+
+    proto="$(dlg --title "$(L '프로토콜 선택' 'Select protocol')" --menu "$(L '프로토콜을 선택하세요.' 'Select a protocol.')" 11 "$DLG_W" 3 \
+        tcp "$(L '일반적인 웹/앱 (대부분 tcp)' 'Common web/app (usually tcp)')" \
+        udp "$(L 'DNS, VPN 등' 'DNS, VPN, etc.')" )" || return
+
+    if yesno "$(L '확인' 'Confirm')" "$(L '다음 정책을 [영구]로 추가합니다.' 'Add the following rule [permanent].')\n\n  $(L '존' 'zone'): $zone\n  $(L '포트' 'port'): ${port}/${proto}\n\n$(L '진행할까요?' 'Proceed?')"; then
+        if firewall-cmd --zone="$zone" --add-port="${port}/${proto}" --permanent >"$TMP_OUT" 2>&1; then
+            firewall-cmd --reload >>"$TMP_OUT" 2>&1
+            msg "$(L '포트 추가 — 성공' 'Add port — OK')" "$(L "${port}/${proto} 포트를 '$zone' 존에서 모두에게 열었습니다.\n재부팅 후에도 유지됩니다." "Opened ${port}/${proto} to everyone in zone '$zone'.\nIt persists across reboots.")\n\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" 14
+        else
+            msg "$(L '포트 추가 — 실패' 'Add port — Failed')" "$(cat "$TMP_OUT")"
+        fi
+    fi
+}
+
+fw_del_port() {
+    local zone port ports args=()
+    zone="$(fw_pick_zone)" || return
+    ports="$(firewall-cmd --zone="$zone" --list-ports 2>/dev/null)"
+    if [[ -z "$ports" ]]; then
+        msg "$(L '포트 삭제' 'Remove port')" "$(L '이 존에 등록된 포트가 없습니다.' 'No ports registered in this zone.') ($zone)"
+        return
+    fi
+    for p in $ports; do args+=("$p" " "); done
+    port="$(dlg --title "$(L '포트 삭제' 'Remove port')" --menu "$(L '삭제할 포트를 선택하세요.' 'Select a port to remove.') ($zone)" \
+        18 "$DLG_W" "$MENU_H" "${args[@]}")" || return
+
+    if port_hits_remote "$port"; then
+        lockout_check "$(L "포트 $port 삭제 ($zone 존) — 원격 접속(SSH) 포트입니다" "remove port $port ($zone) — this is a remote-access (SSH) port")" || return
+    fi
+    if yesno "$(L '확인' 'Confirm')" "$(L '다음 포트 정책을 삭제합니다.' 'Remove the following port rule.')\n\n  $(L '존' 'zone'): $zone\n  $(L '포트' 'port'): $port\n\n$(L '진행할까요?' 'Proceed?')"; then
+        if firewall-cmd --zone="$zone" --remove-port="$port" --permanent >"$TMP_OUT" 2>&1; then
+            firewall-cmd --reload >>"$TMP_OUT" 2>&1
+            msg "$(L '포트 삭제 — 성공' 'Remove port — OK')" "$(L "'$zone' 존에서 $port 포트를 닫았습니다." "Closed $port in zone '$zone'.")\n\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" 14
+        else
+            msg "$(L '포트 삭제 — 실패' 'Remove port — Failed')" "$(cat "$TMP_OUT")"
+        fi
+    fi
+}
+
+fw_add_source() {
+    local zone ip
+    zone="$(fw_pick_zone)" || return
+    ip="$(dlg_input "$(L '출발지 IP를 존에 등록' 'Assign source IP to zone')" \
+        "$(L "이 IP/대역에서 오는 접속에 '$zone' 존의 규칙을 적용합니다.\n예) 192.168.0.10  또는  192.168.0.0/24\n\n※ '특정 IP만 어떤 포트에 접속 허용'이 목적이면\n   '특정 IP에서만 포트 허용' 메뉴를 쓰세요." \
+             "Traffic from this IP/CIDR will use the '$zone' zone rules.\ne.g. 192.168.0.10  or  192.168.0.0/24\n\n* To allow ONLY a specific IP to reach a port,\n  use 'Allow a port only from a specific IP'.")")" || return
+    [[ -z "$ip" ]] && { msg "$(L '출발지 IP 등록' 'Assign source IP')" "$(L 'IP가 비어 있습니다.' 'IP is empty.')"; return; }
+    valid_ipcidr "$ip" || { msg "$(L '출발지 IP 등록' 'Assign source IP')" "$(L "'$ip' 는 올바른 IP/대역이 아닙니다." "'$ip' is not a valid IP/CIDR.")" 8; return; }
+
+    if yesno "$(L '확인' 'Confirm')" "$(L '다음 출발지(source)를 존에 [영구]로 허용합니다.' 'Allow the following source [permanent].')\n\n  $(L '존' 'zone'): $zone\n  IP: $ip\n\n$(L '진행할까요?' 'Proceed?')"; then
+        if firewall-cmd --zone="$zone" --add-source="$ip" --permanent >"$TMP_OUT" 2>&1; then
+            firewall-cmd --reload >>"$TMP_OUT" 2>&1
+            msg "$(L '출발지 IP 등록 — 성공' 'Assign source IP — OK')" "$(L "$ip 에서 오는 접속에 이제 '$zone' 존 규칙이 적용됩니다." "Traffic from $ip now uses the '$zone' zone rules.")\n\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" 14
+        else
+            msg "$(L '출발지 IP 등록 — 실패' 'Assign source IP — Failed')" "$(cat "$TMP_OUT")"
+        fi
+    fi
+}
+
+fw_del_source() {
+    local zone ip sources args=()
+    zone="$(fw_pick_zone)" || return
+    sources="$(firewall-cmd --zone="$zone" --list-sources 2>/dev/null)"
+    if [[ -z "$sources" ]]; then
+        msg "$(L '출발지 IP 등록 삭제' 'Remove source IP')" "$(L '이 존에 등록된 출발지 IP가 없습니다.' 'No source IPs in this zone.') ($zone)"
+        return
+    fi
+    for s in $sources; do args+=("$s" " "); done
+    ip="$(dlg --title "$(L '출발지 IP 등록 삭제' 'Remove source IP')" --menu "$(L '삭제할 출발지 IP를 선택하세요.' 'Select a source IP to remove.') ($zone)" \
+        18 "$DLG_W" "$MENU_H" "${args[@]}")" || return
+
+    lockout_check "$(L "출발지 IP $ip 삭제 ($zone 존) — 이 IP 로 접속 중이라면 끊길 수 있습니다" "remove source $ip ($zone) — you may be cut off if you connect from it")" || return
+    if yesno "$(L '확인' 'Confirm')" "$(L '다음 출발지를 존에서 삭제합니다.' 'Remove this source from the zone.')\n  $ip ($zone)\n\n$(L '진행할까요?' 'Proceed?')"; then
+        if firewall-cmd --zone="$zone" --remove-source="$ip" --permanent >"$TMP_OUT" 2>&1; then
+            firewall-cmd --reload >>"$TMP_OUT" 2>&1
+            msg "$(L '출발지 IP 등록 삭제 — 성공' 'Remove source IP — OK')" "$(L "$ip 를 '$zone' 존에서 뺐습니다." "Removed $ip from zone '$zone'.")\n\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" 14
+        else
+            msg "$(L '출발지 IP 등록 삭제 — 실패' 'Remove source IP — Failed')" "$(cat "$TMP_OUT")"
+        fi
+    fi
+}
+
+# rich rule as a readable sentence (the raw rule if the format is different)
+rich_human() {
+    if [[ "$LANG_MODE" == "en" ]]; then
+        sed -E 's/^rule family="ipv[46]" source address="([^"]+)" port port="([^"]+)" protocol="([^"]+)" accept$/allow \2\/\3 only from \1/'
+    else
+        sed -E 's/^rule family="ipv[46]" source address="([^"]+)" port port="([^"]+)" protocol="([^"]+)" accept$/\1 에서만 \2\/\3 접속 허용/'
+    fi
+}
+
+# allow a port from one IP only (firewalld rich rule)
+fw_add_ip_port_rule() {
+    local zone ip port proto fam rule
+    zone="$(fw_pick_zone)" || return
+    ip="$(dlg_input "$(L '특정 IP에서만 포트 허용 (1/3)' 'Allow a port only from a specific IP (1/3)')" \
+        "$(L '접속을 허용할 출발지 IP 또는 대역을 입력하세요.\n예) 192.168.0.10  또는  192.168.0.0/24' \
+             'Enter the source IP or CIDR to allow.\ne.g. 192.168.0.10  or  192.168.0.0/24')")" || return
+    [[ -z "$ip" ]] && return
+    valid_ipcidr "$ip" || { msg "$(L '특정 IP에서만 포트 허용' 'Allow port from IP')" "$(L "'$ip' 는 올바른 IP/대역이 아닙니다." "'$ip' is not a valid IP/CIDR.")" 8; return; }
+    port="$(dlg_input "$(L '특정 IP에서만 포트 허용 (2/3)' 'Allow a port only from a specific IP (2/3)')" \
+        "$(L "$ip 에게 열어줄 포트 번호를 입력하세요.\n예) 3306  또는  8000-8100" \
+             "Port to open for $ip.\ne.g. 3306  or  8000-8100")")" || return
+    [[ -z "$port" ]] && return
+    valid_port "$port" || { msg "$(L '특정 IP에서만 포트 허용' 'Allow port from IP')" "$(L "'$port' 는 올바른 포트가 아닙니다." "'$port' is not a valid port.")" 8; return; }
+    proto="$(dlg --title "$(L '특정 IP에서만 포트 허용 (3/3)' 'Allow a port only from a specific IP (3/3)')" \
+        --menu "$(L '프로토콜을 선택하세요.' 'Select a protocol.')" 11 "$DLG_W" 2 \
+        tcp "$(L '일반적인 웹/앱/DB (대부분 tcp)' 'Common web/app/DB (usually tcp)')" \
+        udp "$(L 'DNS, VPN 등' 'DNS, VPN, etc.')")" || return
+    fam="ipv4"; [[ "$ip" == *:* ]] && fam="ipv6"
+    rule="rule family=\"$fam\" source address=\"$ip\" port port=\"$port\" protocol=\"$proto\" accept"
+
+    yesno "$(L '확인' 'Confirm')" "$(L '다음 규칙을 [영구]로 추가합니다.' 'Add the following rule [permanent].')\n\n  $(L '존' 'zone'): $zone\n  $(L '허용 IP' 'from'): $ip\n  $(L '포트' 'port'): ${port}/${proto}\n\n$(L "※ 이 포트가 '포트 추가'로 모두에게 열려 있다면\n   이 규칙과 상관없이 모두 접속 가능합니다." "* If this port is also opened to everyone via 'Add port',\n  everyone can still connect regardless of this rule.")\n\n$(L '진행할까요?' 'Proceed?')" 16 || return
+    if firewall-cmd --zone="$zone" --add-rich-rule="$rule" --permanent >"$TMP_OUT" 2>&1; then
+        firewall-cmd --reload >>"$TMP_OUT" 2>&1
+        msg "$(L '특정 IP 허용 — 성공' 'Allow from IP — OK')" "$(L "이제 $ip 에서만 ${port}/${proto} 포트로 접속할 수 있습니다. ('$zone' 존)\n재부팅 후에도 유지됩니다." "Now only $ip can connect to ${port}/${proto} (zone '$zone').\nIt persists across reboots.")\n\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" 14
+    else
+        msg "$(L '특정 IP 허용 — 실패' 'Allow from IP — Failed')" "$(cat "$TMP_OUT")"
+    fi
+}
+
+fw_del_ip_port_rule() {
+    local zone rules args=() i=0 r idx rule
+    zone="$(fw_pick_zone)" || return
+    mapfile -t rules < <(firewall-cmd --zone="$zone" --list-rich-rules 2>/dev/null)
+    if [[ ${#rules[@]} -eq 0 ]]; then
+        msg "$(L '특정 IP 허용 규칙 삭제' 'Remove IP rule')" "$(L '이 존에 등록된 규칙이 없습니다.' 'No rules in this zone.') ($zone)" 8
+        return
+    fi
+    for r in "${rules[@]}"; do args+=("$i" "$(rich_human <<<"$r")"); ((i++)); done
+    idx="$(dlg --title "$(L '특정 IP 허용 규칙 삭제' 'Remove IP rule')" \
+        --menu "$(L '삭제할 규칙을 선택하세요.' 'Select a rule to remove.') ($zone)" \
+        "$DLG_H" "$DLG_W" "$MENU_H" "${args[@]}")" || return
+    rule="${rules[$idx]}"
+    local rport
+    rport="$(sed -n 's/.*port port="\([0-9-]*\)".*/\1/p' <<<"$rule")"
+    if [[ -n "$rport" ]] && port_hits_remote "$rport"; then
+        lockout_check "$(L "원격 접속 포트($rport) 규칙 삭제" "remove a rule for the remote-access port ($rport)")" || return
+    elif [[ "$rule" == *'service name="ssh"'* ]]; then
+        lockout_check "$(L "ssh 서비스 규칙 삭제" "remove an ssh service rule")" || return
+    fi
+    yesno "$(L '확인' 'Confirm')" "$(L '다음 규칙을 삭제합니다.' 'Remove this rule.')\n\n  $rule\n\n$(L '진행할까요?' 'Proceed?')" 12 || return
+    if firewall-cmd --zone="$zone" --remove-rich-rule="$rule" --permanent >"$TMP_OUT" 2>&1; then
+        firewall-cmd --reload >>"$TMP_OUT" 2>&1
+        msg "$(L '규칙 삭제 — 성공' 'Remove rule — OK')" "$(L "규칙을 삭제했습니다:" "Removed rule:") $(rich_human <<<"$rule")\n\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" 14
+    else
+        msg "$(L '규칙 삭제 — 실패' 'Remove rule — Failed')" "$(cat "$TMP_OUT")"
+    fi
+}
+
+fw_service_manage() {
+    local zone action svc svcs args=()
+    zone="$(fw_pick_zone)" || return
+    action="$(dlg --title "$(L '서비스 관리' 'Service management')" --menu "$(L '무엇을 할까요?' 'What to do?') ($zone)" 12 "$DLG_W" 2 \
+        add "$(L '서비스 추가 (예: http, https, mysql)' 'Add service (e.g. http, https, mysql)')" \
+        del "$(L '등록된 서비스 삭제' 'Remove a registered service')" )" || return
+
+    if [[ "$action" == "add" ]]; then
+        svcs="$(firewall-cmd --get-services 2>/dev/null | tr ' ' '\n' | sort)"
+        for s in $svcs; do args+=("$s" " "); done
+        svc="$(dlg --title "$(L '서비스 추가' 'Add service')" --menu "$(L '추가할 서비스를 선택하세요.' 'Select a service to add.')" \
+            "$DLG_H" "$DLG_W" "$MENU_H" "${args[@]}")" || return
+        if firewall-cmd --zone="$zone" --add-service="$svc" --permanent >"$TMP_OUT" 2>&1; then
+            firewall-cmd --reload >>"$TMP_OUT" 2>&1
+            msg "$(L '서비스 추가 — 성공' 'Add service — OK')" "$(L "'$svc' 서비스를 '$zone' 존에서 모두에게 열었습니다." "Opened service '$svc' to everyone in zone '$zone'.")\n\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" 14
+        else
+            msg "$(L '서비스 추가 — 실패' 'Add service — Failed')" "$(cat "$TMP_OUT")"
+        fi
+    else
+        svcs="$(firewall-cmd --zone="$zone" --list-services 2>/dev/null)"
+        [[ -z "$svcs" ]] && { msg "$(L '서비스 삭제' 'Remove service')" "$(L '등록된 서비스가 없습니다.' 'No services registered.')"; return; }
+        for s in $svcs; do args+=("$s" " "); done
+        svc="$(dlg --title "$(L '서비스 삭제' 'Remove service')" --menu "$(L '삭제할 서비스를 선택하세요.' 'Select a service to remove.')" \
+            18 "$DLG_W" "$MENU_H" "${args[@]}")" || return
+        if [[ "$svc" == "ssh" ]]; then
+            lockout_check "$(L "ssh 서비스 삭제 ($zone 존) — 새 SSH 접속이 막힙니다" "remove the ssh service ($zone) — new SSH logins will be blocked")" || return
+        fi
+        yesno "$(L '확인' 'Confirm')" "$(L '다음 서비스를 존에서 삭제합니다.' 'Remove this service from the zone.')\n\n  $svc ($zone)\n\n$(L '진행할까요?' 'Proceed?')" || return
+        if firewall-cmd --zone="$zone" --remove-service="$svc" --permanent >"$TMP_OUT" 2>&1; then
+            firewall-cmd --reload >>"$TMP_OUT" 2>&1
+            msg "$(L '서비스 삭제 — 성공' 'Remove service — OK')" "$(L "'$zone' 존에서 '$svc' 서비스를 닫았습니다." "Closed service '$svc' in zone '$zone'.")\n\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" 14
+        else
+            msg "$(L '서비스 삭제 — 실패' 'Remove service — Failed')" "$(cat "$TMP_OUT")"
+        fi
+    fi
+}
+
+fw_reload() {
+    run_show "$(L '방화벽 다시 적용(reload)' 'Reload firewall')" firewall-cmd --reload
+}
+
+# extract only the active zone names (lines that are not indented)
+fw_active_zones() { firewall-cmd --get-active-zones 2>/dev/null | grep -v '^[[:space:]]'; }
+
+# short view: open ports only
+fw_view_ports() {
+    {
+        echo "$(L '현재 열린 포트 / 서비스 (활성 존)' 'Open ports / services (active zones)')"
+        echo "===================================================================="
+        local z
+        for z in $(fw_active_zones); do
+            echo
+            echo "[ zone: $z ]"
+            echo "  $(L '포트(모두에게 열림)' 'ports (open to all)')  : $(firewall-cmd --zone="$z" --list-ports 2>/dev/null)"
+            echo "  $(L '서비스(모두에게 열림)' 'services (open to all)'): $(firewall-cmd --zone="$z" --list-services 2>/dev/null)"
+            local rr
+            rr="$(firewall-cmd --zone="$z" --list-rich-rules 2>/dev/null)"
+            if [[ -n "$rr" ]]; then
+                echo "  $(L '특정 IP 전용 규칙' 'IP-specific rules'):"
+                rich_human <<<"$rr" | sed 's/^/    - /'
+            fi
+        done
+    } | fold -s -w "$((DLG_W-6))" >"$TMP_OUT"
+    flush_input
+    dialog --backtitle "$BACKTITLE" --exit-label "$(L '닫기' 'Close')" \
+        --title "$(L '현재 포트 보기' 'Current ports')" --textbox "$TMP_OUT" "$DLG_H" "$DLG_W"
+}
+
+# short view: allowed source IPs only
+fw_view_sources() {
+    {
+        echo "$(L '현재 허용된 출발지 IP (활성 존)' 'Allowed source IPs (active zones)')"
+        echo "===================================================================="
+        local z s
+        for z in $(fw_active_zones); do
+            s="$(firewall-cmd --zone="$z" --list-sources 2>/dev/null)"
+            echo
+            echo "[ zone: $z ]"
+            echo "  $(L '존에 등록된 IP/대역' 'zone sources'): ${s:-$(L '(없음)' '(none)')}"
+            local ri
+            ri="$(firewall-cmd --zone="$z" --list-rich-rules 2>/dev/null | sed -n 's/.*source address="\([^"]*\)".*port port="\([^"]*\)" protocol="\([^"]*\)".*/\1 → \2\/\3/p')"
+            if [[ -n "$ri" ]]; then
+                echo "  $(L '특정 포트만 허용된 IP' 'IPs allowed to specific ports'):"
+                sed 's/^/    - /' <<<"$ri"
+            fi
+        done
+    } | fold -s -w "$((DLG_W-6))" >"$TMP_OUT"
+    flush_input
+    dialog --backtitle "$BACKTITLE" --exit-label "$(L '닫기' 'Close')" \
+        --title "$(L '현재 IP 보기' 'Current source IPs')" --textbox "$TMP_OUT" "$DLG_H" "$DLG_W"
+}
+
+firewall_menu() {
+    if ! need_cmd firewall-cmd; then
+        msg "$(L '방화벽' 'Firewall')" "$(L 'firewalld 가 설치되어 있지 않습니다.' 'firewalld is not installed.')\n\n  dnf install firewalld\n  systemctl enable --now firewalld"
+        return
+    fi
+    if ! fw_running; then
+        if yesno "$(L '방화벽 꺼짐' 'Firewall off')" "$(L 'firewalld 서비스가 실행 중이 아닙니다.\n지금 시작할까요? (systemctl start firewalld)' \
+                                                        'firewalld is not running.\nStart it now? (systemctl start firewalld)')"; then
+            systemctl start firewalld >"$TMP_OUT" 2>&1 || msg "$(L '시작 실패' 'Start failed')" "$(cat "$TMP_OUT")"
+        fi
+    fi
+
+    while true; do
+        local choice
+        choice="$(dlg --title "$(L '방화벽 관리 (firewalld)' 'Firewall (firewalld)')" --cancel-label "$(L '뒤로' 'Back')" \
+            --menu "$(L '원하는 작업을 선택하세요.' 'Choose an action.')\n$(L '기본 존' 'Default zone'): $(fw_default_zone)" \
+            "$DLG_H" "$DLG_W" "$MENU_H" \
+            1  "$(L '현재 포트 보기' 'View current ports')" \
+            2  "$(L '현재 IP 보기 (출발지)' 'View current source IPs')" \
+            3  "$(L '현재 정책 한눈에 보기 (전체)' 'Full policy overview')" \
+            4  "$(L '포트 추가 (모두에게 열기)' 'Add port (open to everyone)')" \
+            5  "$(L '포트 삭제' 'Remove port')" \
+            6  "$(L '특정 IP에서만 포트 허용' 'Allow a port only from a specific IP')" \
+            7  "$(L '특정 IP 허용 규칙 삭제' 'Remove an IP-specific rule')" \
+            8  "$(L '출발지 IP를 존에 등록' 'Assign source IP to zone')" \
+            9  "$(L '출발지 IP 등록 삭제' 'Remove source IP from zone')" \
+            10 "$(L '서비스 추가 / 삭제' 'Add / remove service')" \
+            11 "$(L '방화벽 다시 적용 (reload)' 'Reload firewall')")" || return
+        case "$choice" in
+            1)  fw_view_ports ;;
+            2)  fw_view_sources ;;
+            3)  fw_overview ;;
+            4)  fw_add_port ;;
+            5)  fw_del_port ;;
+            6)  fw_add_ip_port_rule ;;
+            7)  fw_del_ip_port_rule ;;
+            8)  fw_add_source ;;
+            9)  fw_del_source ;;
+            10) fw_service_manage ;;
+            11) fw_reload ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
+# SELinux
+# ---------------------------------------------------------------------------
+se_status() {
+    {
+        echo "===================================================================="
+        echo " $(L 'SELinux 상태' 'SELinux status')"
+        echo "===================================================================="
+        echo
+        echo "[ $(L '현재 동작 모드' 'Current mode') ]  $(getenforce 2>&1)"
+        echo "  - Enforcing  : $(L "정책 위반을 '차단'" "block policy violations")"
+        echo "  - Permissive : $(L "위반을 '기록만' 하고 허용 (문제 진단용)" "log only, do not block (for troubleshooting)")"
+        echo "  - Disabled   : $(L 'SELinux 꺼짐' 'SELinux off')"
+        echo
+        echo "===================================================================="
+        sestatus 2>&1
+    } | fold -s -w "$((DLG_W-6))" >"$TMP_OUT"
+    flush_input
+    dialog --backtitle "$BACKTITLE" --exit-label "$(L '닫기' 'Close')" --title "$(L 'SELinux 상태' 'SELinux status')" \
+        --textbox "$TMP_OUT" "$DLG_H" "$DLG_W"
+}
+
+se_toggle_mode() {
+    local cur choice
+    cur="$(getenforce 2>/dev/null)"
+    if [[ "$cur" == "Disabled" ]]; then
+        msg "$(L '모드 전환' 'Switch mode')" "$(L 'SELinux 가 Disabled 상태입니다.\n활성화는 /etc/selinux/config 수정 + 재부팅이 필요합니다.' \
+                                               'SELinux is Disabled.\nEnabling requires editing /etc/selinux/config and a reboot.')"
+        return
+    fi
+    choice="$(dlg --title "$(L '동작 모드 전환 (일시적)' 'Switch mode (temporary)')" --menu \
+        "$(L '현재 모드' 'Current mode'): $cur\n\n$(L '일시적으로 전환합니다. (재부팅 시 원복)\n영구 변경은 /etc/selinux/config 를 수정해야 합니다.' \
+             'Temporary switch (reverts on reboot).\nFor a permanent change, edit /etc/selinux/config.')" \
+        14 "$DLG_W" 2 \
+        Enforcing  "$(L '정책 위반 차단 (권장)' 'Block violations (recommended)')" \
+        Permissive "$(L '위반 기록만 — 문제 진단 시 임시 사용' 'Log only — temporary for troubleshooting')")" || return
+    case "$choice" in
+        Enforcing)  run_show "$(L 'Enforcing 전환' 'Switch to Enforcing')"  setenforce 1 ;;
+        Permissive) run_show "$(L 'Permissive 전환' 'Switch to Permissive')" setenforce 0 ;;
+    esac
+}
+
+# --- SELinux port policy ---
+se_port_view()  { show_text "$(L 'SELinux 포트 정책 목록' 'SELinux port policies')" bash -c "semanage port -l"; }
+
+se_pick_port_type() {
+    local sel
+    sel="$(dlg --title "$(L 'SELinux 포트 타입 선택' 'Select SELinux port type')" --menu \
+        "$(L "허용할 포트의 서비스 타입을 선택하세요.\n(목록에 없으면 '직접 입력')" \
+             "Select the service type for this port.\n(If not listed, choose 'Custom')")" \
+        "$DLG_H" "$DLG_W" "$MENU_H" \
+        http_port_t       "$(L '웹 (Apache/Nginx)' 'Web (Apache/Nginx)')" \
+        ssh_port_t        "SSH" \
+        mysqld_port_t     "MySQL / MariaDB" \
+        postgresql_port_t "PostgreSQL" \
+        dns_port_t        "DNS" \
+        smtp_port_t       "$(L '메일 (SMTP)' 'Mail (SMTP)')" \
+        ftp_port_t        "FTP" \
+        transproxy_port_t "$(L '프록시' 'Proxy')" \
+        __custom__        "$(L '직접 입력...' 'Custom...')")" || return 1
+    if [[ "$sel" == "__custom__" ]]; then
+        dlg_input "$(L '타입 직접 입력' 'Custom type')" "$(L 'SELinux 포트 타입을 입력하세요.\n예) redis_port_t' 'Enter a SELinux port type.\ne.g. redis_port_t')"
+    else
+        echo "$sel"
+    fi
+}
+
+se_pick_fcontext_type() {
+    local sel
+    sel="$(dlg --title "$(L 'SELinux 파일 타입 선택' 'Select SELinux file type')" --menu \
+        "$(L "적용할 SELinux 타입을 선택하세요.\n(목록에 없으면 '직접 입력')" \
+             "Select the SELinux type to apply.\n(If not listed, choose 'Custom')")" \
+        "$DLG_H" "$DLG_W" "$MENU_H" \
+        httpd_sys_content_t     "$(L '웹 읽기 컨텐츠 (Apache/Nginx)' 'Web content, read (Apache/Nginx)')" \
+        httpd_sys_rw_content_t  "$(L '웹 읽기+쓰기 컨텐츠' 'Web content, read+write')" \
+        httpd_sys_script_exec_t "$(L '웹 CGI/스크립트 실행' 'Web CGI/script exec')" \
+        samba_share_t           "$(L 'Samba 공유' 'Samba share')" \
+        public_content_t        "$(L '공개 읽기 (FTP 등)' 'Public read (FTP, etc.)')" \
+        public_content_rw_t     "$(L '공개 읽기+쓰기' 'Public read+write')" \
+        var_log_t               "$(L '로그 파일' 'Log files')" \
+        container_file_t        "$(L '컨테이너 파일' 'Container files')" \
+        __custom__              "$(L '직접 입력...' 'Custom...')")" || return 1
+    if [[ "$sel" == "__custom__" ]]; then
+        dlg_input "$(L '타입 직접 입력' 'Custom type')" "$(L '적용할 SELinux 타입을 입력하세요.\n예) mysqld_db_t' 'Enter a SELinux type.\ne.g. mysqld_db_t')"
+    else
+        echo "$sel"
+    fi
+}
+
+se_port_add() {
+    local type port proto
+    type="$(se_pick_port_type)" || return
+    [[ -z "$type" ]] && return
+    port="$(dlg_input "$(L '포트 번호' 'Port number')" "$(L '허용할 포트 번호를 입력하세요. 예) 8080' 'Enter the port number. e.g. 8080')")" || return
+    [[ -z "$port" ]] && return
+    proto="$(dlg --title "$(L '프로토콜' 'Protocol')" --menu "$(L '프로토콜 선택' 'Select protocol')" 10 "$DLG_W" 2 tcp " " udp " ")" || return
+
+    if yesno "$(L '확인' 'Confirm')" "$(L 'SELinux 포트 정책을 추가합니다.' 'Add SELinux port policy.')\n\n  $(L '타입' 'type'): $type\n  $(L '포트' 'port'): ${port}/${proto}\n\n(semanage port -a -t $type -p $proto $port)\n$(L '진행할까요?' 'Proceed?')"; then
+        run_show "$(L 'SELinux 포트 정책 추가' 'Add SELinux port policy')" semanage port -a -t "$type" -p "$proto" "$port"
+    fi
+}
+
+se_port_del() {
+    local line type port proto
+    mapfile -t rows < <(semanage port -l -C 2>/dev/null | awk 'NR>2 && NF>=3')
+    if [[ ${#rows[@]} -eq 0 ]]; then
+        msg "$(L 'SELinux 포트 정책 삭제' 'Remove SELinux port policy')" "$(L '사용자가 추가한(local) 포트 정책이 없습니다.\n기본 내장 정책은 삭제할 수 없습니다.' \
+             'No user-added (local) port policies.\nBuilt-in policies cannot be removed.')"
+        return
+    fi
+    local args=() i=0
+    for line in "${rows[@]}"; do args+=("$i" "$line"); ((i++)); done
+    local idx
+    idx="$(dlg --title "$(L 'SELinux 포트 정책 삭제' 'Remove SELinux port policy')" --menu \
+        "$(L '삭제할 정책을 선택하세요. (사용자 추가 정책만 표시)' 'Select a policy to remove (user-added only).')" \
+        "$DLG_H" "$DLG_W" "$MENU_H" "${args[@]}")" || return
+    line="${rows[$idx]}"
+    type="$(awk '{print $1}' <<<"$line")"
+    proto="$(awk '{print $2}' <<<"$line")"
+    port="$(awk '{print $3}' <<<"$line")"
+    if yesno "$(L '확인' 'Confirm')" "$(L '다음 정책을 삭제합니다.' 'Remove the following policy.')\n\n  $line\n\n(semanage port -d -t $type -p $proto $port)\n$(L '진행할까요?' 'Proceed?')"; then
+        run_show "$(L 'SELinux 포트 정책 삭제' 'Remove SELinux port policy')" semanage port -d -t "$type" -p "$proto" "$port"
+    fi
+}
+
+# --- SELinux Boolean ---
+se_bool_view() { show_text "$(L 'SELinux Boolean 목록 (getsebool -a)' 'SELinux Booleans (getsebool -a)')" getsebool -a; }
+
+se_pick_bool() {
+    local sel b args=()
+    # switches that are commonly turned on - shown with their current value
+    for b in httpd_can_network_connect httpd_can_network_connect_db httpd_can_sendmail \
+             httpd_use_nfs httpd_enable_homedirs httpd_unified samba_enable_home_dirs \
+             ftpd_full_access nis_enabled; do
+        getsebool "$b" >/dev/null 2>&1 || continue
+        local cur desc
+        cur="$(getsebool "$b" 2>/dev/null | awk '{print $NF}')"
+        case "$b" in
+            httpd_can_network_connect)    desc="$(L '웹서버 → 다른 서버(API/WAS)로 접속' 'Web server → connect to other servers')" ;;
+            httpd_can_network_connect_db) desc="$(L '웹서버 → DB 서버로 접속' 'Web server → connect to DB')" ;;
+            httpd_can_sendmail)           desc="$(L '웹서버 → 메일 발송' 'Web server → send mail')" ;;
+            httpd_use_nfs)                desc="$(L '웹서버 → NFS 경로 사용' 'Web server → use NFS')" ;;
+            httpd_enable_homedirs)        desc="$(L '웹서버 → 사용자 홈디렉토리 제공' 'Web server → serve home dirs')" ;;
+            httpd_unified)                desc="$(L '웹서버 → 컨텐츠 읽기/쓰기/실행 통합 허용' 'Web server → unified content access')" ;;
+            samba_enable_home_dirs)       desc="$(L 'Samba → 홈디렉토리 공유' 'Samba → share home dirs')" ;;
+            ftpd_full_access)             desc="$(L 'FTP → 파일시스템 전체 접근' 'FTP → full filesystem access')" ;;
+            nis_enabled)                  desc="$(L 'NIS/임의 포트 네트워크 사용 허용' 'NIS / arbitrary network ports')" ;;
+        esac
+        args+=("$b" "[$cur] $desc")
+    done
+    args+=("__custom__" "$(L '직접 입력...' 'Custom...')")
+    sel="$(dlg --title "$(L 'Boolean 스위치 선택' 'Select Boolean')" --menu \
+        "$(L "바꿀 스위치를 고르세요. [ ] 안은 현재 값입니다.\n(목록에 없으면 '직접 입력')" \
+             "Pick a switch. [ ] shows the current value.\n(If not listed, choose 'Custom')")" \
+        "$DLG_H" "$DLG_W" "$MENU_H" "${args[@]}")" || return 1
+    if [[ "$sel" == "__custom__" ]]; then
+        dlg_input "$(L 'Boolean 직접 입력' 'Custom Boolean')" \
+            "$(L "변경할 Boolean 이름을 입력하세요.\n예) httpd_can_network_connect\n\n전체 목록은 'Boolean 스위치 보기'에서 확인." \
+                 "Enter the Boolean name.\ne.g. httpd_can_network_connect\n\nSee 'View Booleans' for the full list.")"
+    else
+        echo "$sel"
+    fi
+}
+
+se_bool_set() {
+    local name state
+    name="$(se_pick_bool)" || return
+    [[ -z "$name" ]] && return
+    if ! getsebool "$name" >/dev/null 2>&1; then
+        msg "$(L 'Boolean 변경' 'Change Boolean')" "$(L "'$name' 이라는 Boolean 을 찾을 수 없습니다." "Boolean '$name' not found.")"
+        return
+    fi
+    state="$(dlg --title "$(L 'Boolean 값' 'Boolean value')" --menu "$(L '현재' 'Current'): $(getsebool "$name")\n\n$(L '설정할 값을 선택하세요.' 'Select a value.')" 12 "$DLG_W" 2 \
+        on  "$(L '허용(on)' 'on (allow)')" off "$(L '차단(off)' 'off (deny)')")" || return
+    if yesno "$(L '확인' 'Confirm')" "$(L 'Boolean 을 영구(-P) 변경합니다.' 'Change Boolean permanently (-P).')\n\n  $name -> $state\n\n$(L '진행할까요?' 'Proceed?')"; then
+        run_show "$(L 'Boolean 변경' 'Change Boolean')" setsebool -P "$name" "$state"
+    fi
+}
+
+# --- file contexts ---
+se_fcontext_view() { show_text "$(L 'SELinux 파일 컨텍스트 (사용자 추가분)' 'SELinux file contexts (user-added)')" semanage fcontext -l -C; }
+
+se_fcontext_add() {
+    local path type
+    path="$(dlg_input "$(L '파일 컨텍스트 추가' 'Add file context')" \
+        "$(L '컨텍스트를 지정할 경로 패턴을 입력하세요.\n예) /srv/myweb(/.*)?   (myweb 폴더 이하 전체)' \
+             'Enter the path pattern for the context.\ne.g. /srv/myweb(/.*)?   (everything under myweb)')")" || return
+    [[ -z "$path" ]] && return
+    type="$(se_pick_fcontext_type)" || return
+    [[ -z "$type" ]] && return
+
+    local base="${path%%(*}"
+    # restorecon -R is recursive: entering a top-level system path by mistake could
+    # relabel the whole server (or a large part of it) - ask again in that case.
+    case "$base" in
+        /|/etc|/etc/|/usr|/usr/|/bin|/bin/|/sbin|/sbin/|/lib|/lib/|/lib64|/lib64/|/var|/var/|/boot|/boot/|/root|/root/|/home|/home/)
+            yesno "$(L '[주의] 넓은 범위 적용' '[CAUTION] Wide scope')" \
+                "$(L "입력한 경로 '$base' 는 시스템 최상위급 디렉토리입니다.\nrestorecon -R 을 여기서 실행하면 그 아래 전체가 재라벨링됩니다.\n\n정말 계속하시겠습니까?" \
+                     "The path '$base' is a top-level system directory.\nrestorecon -R here will relabel everything under it.\n\nAre you sure you want to continue?")" || return
+            ;;
+    esac
+
+    if yesno "$(L '확인' 'Confirm')" "$(L '파일 컨텍스트 규칙을 추가하고 적용(restorecon)합니다.' 'Add the file-context rule and apply (restorecon).')\n\n  $(L '경로' 'path'): $path\n  $(L '타입' 'type'): $type\n  $(L '재귀 적용 대상' 'recursive target'): $base\n\n$(L '진행할까요?' 'Proceed?')"; then
+        if semanage fcontext -a -t "$type" "$path" >"$TMP_OUT" 2>&1; then
+            restorecon -Rv "$base" >>"$TMP_OUT" 2>&1
+            local nrel
+            nrel="$(grep -c '^Relabeled' "$TMP_OUT")"
+            if [[ "$nrel" -gt 0 ]]; then
+                msg "$(L '파일 컨텍스트 추가 — 성공' 'Add file context — OK')" "$(L "규칙을 등록하고, $base 아래 파일 ${nrel}개의 라벨을 $type 로 바꿨습니다.\n앞으로 이 경로에 새로 만드는 파일에도 같은 라벨이 붙습니다." "Rule added; relabeled ${nrel} file(s) under $base to $type.\nNew files under this path will get the same label.")\n\n$(L '바뀐 파일' 'Relabeled'):\n$(cat "$TMP_OUT")"
+            else
+                msg "$(L '파일 컨텍스트 추가 — 성공' 'Add file context — OK')" "$(L "규칙을 등록했습니다. ($path → $type)\n\n$base 아래 파일은 이미 알맞은 라벨이라 바뀐 파일이 없습니다.\n(폴더가 아직 없다면, 나중에 만들 때 이 라벨이 붙습니다)" "Rule added ($path → $type).\n\nFiles under $base already have the right label; nothing changed.\n(If the folder does not exist yet, it will get this label when created)")" 12
+            fi
+        else
+            msg "$(L '파일 컨텍스트 추가 — 실패' 'Add file context — Failed')" "$(cat "$TMP_OUT")"
+        fi
+    fi
+}
+
+se_fcontext_del() {
+    mapfile -t rows < <(semanage fcontext -l -C 2>/dev/null | awk 'NF>=2 && $1 ~ /^\//')
+    if [[ ${#rows[@]} -eq 0 ]]; then
+        msg "$(L '파일 컨텍스트 삭제' 'Remove file context')" "$(L '사용자가 추가한 파일 컨텍스트 규칙이 없습니다.' 'No user-added file-context rules.')"
+        return
+    fi
+    local args=() i=0 line
+    for line in "${rows[@]}"; do args+=("$i" "$line"); ((i++)); done
+    local idx
+    idx="$(dlg --title "$(L '파일 컨텍스트 삭제' 'Remove file context')" --menu "$(L '삭제할 규칙을 선택하세요.' 'Select a rule to remove.')" \
+        "$DLG_H" "$DLG_W" "$MENU_H" "${args[@]}")" || return
+    local path
+    path="$(awk '{print $1}' <<<"${rows[$idx]}")"
+    if yesno "$(L '확인' 'Confirm')" "$(L '다음 파일 컨텍스트 규칙을 삭제합니다.' 'Remove the following file-context rule.')\n\n  $path\n\n$(L '진행할까요?' 'Proceed?')"; then
+        run_show "$(L '파일 컨텍스트 삭제' 'Remove file context')" semanage fcontext -d "$path"
+    fi
+}
+
+# --- audit2allow ---
+se_audit2allow() {
+    if ! need_cmd audit2allow; then
+        msg "$(L '허용 정책 생성' 'Generate allow policy')" "$(L 'audit2allow 가 없습니다. (dnf install policycoreutils-python-utils)' 'audit2allow not found. (dnf install policycoreutils-python-utils)')"
+        return
+    fi
+    # --input-logs: always read the log files, even when stdin is not a terminal
+    ausearch --input-logs -m avc,user_avc -ts recent >"$TMP_OUT" 2>&1
+    if ! grep -q "type=AVC\|type=USER_AVC" "$TMP_OUT" 2>/dev/null; then
+        msg "$(L '허용 정책 생성' 'Generate allow policy')" "$(L '최근 10분 안에 SELinux 거부(denial) 기록이 없습니다.\n\n먼저 문제가 되는 작업을 한 번 실행해\n거부 로그를 남긴 뒤 바로 다시 시도하세요.' \
+             'No SELinux denials in the last 10 minutes.\n\nRun the failing operation once to produce a\ndenial, then try again right away.')" 11
+        return
+    fi
+    fold -s -w "$((DLG_W-6))" "$TMP_OUT" >"$TMP_OUT.f" && mv -f "$TMP_OUT.f" "$TMP_OUT"
+    flush_input
+    dialog --backtitle "$BACKTITLE" --exit-label "$(L '닫기' 'Close')" --title "$(L '최근 SELinux 거부 로그' 'Recent SELinux denials')" \
+        --textbox "$TMP_OUT" "$DLG_H" "$DLG_W"
+
+    # Choose which program's denials to allow - allowing all recent denials at once
+    # easily grants permissions to programs that have nothing to do with the problem.
+    local args=() comm cnt sel
+    while read -r cnt comm; do
+        [[ -z "$comm" ]] && continue
+        args+=("$comm" "$(L "거부 ${cnt}건" "${cnt} denial(s)")")
+    done < <(ausearch --input-logs -m avc,user_avc -ts recent 2>/dev/null \
+                | grep -E "type=(USER_)?AVC" | grep -o ' comm="[^"]*"' | sed 's/ comm="\(.*\)"/\1/' \
+                | sort | uniq -c | sort -rn)
+    args+=("__all__" "$(L '전체 (권장하지 않음)' 'All (not recommended)')")
+    sel="$(dlg --title "$(L '허용할 프로그램 선택' 'Select the program to allow')" --menu \
+        "$(L "어떤 프로그램이 막힌 문제를 해결하려는지 고르세요.\n고른 프로그램의 거부만 허용 정책에 들어갑니다.\n(예: 웹서버 문제면 httpd / nginx)" \
+             "Which program's denials are you fixing?\nOnly the selected program's denials go into the policy.\n(e.g. httpd / nginx for a web server issue)")" \
+        "$DLG_H" "$DLG_W" "$MENU_H" "${args[@]}")" || return
+
+    local denials="$TMP_OUT.avc"
+    if [[ "$sel" == "__all__" ]]; then
+        ausearch --input-logs -m avc,user_avc -ts recent >"$denials" 2>/dev/null
+    else
+        ausearch --input-logs -m avc,user_avc -ts recent -c "$sel" >"$denials" 2>/dev/null
+    fi
+
+    local modname
+    modname="$(dlg_input "$(L '허용 정책 생성' 'Generate allow policy')" \
+        "$(L '선택한 거부들을 허용하는 정책 모듈을 만듭니다.\n모듈 이름을 정하세요. 예) mywebfix' \
+             'Create a policy module allowing the selected denials.\nName the module. e.g. mywebfix')")" || { rm -f "$denials"; return; }
+    [[ -z "$modname" ]] && { rm -f "$denials"; return; }
+
+    # The module name is used as a file name (audit2allow -M / semodule -i), so path
+    # characters such as '/' or '..' could write outside the work directory or load a
+    # policy (.pp) from an arbitrary path - allow letters, digits, underscore and hyphen only.
+    while [[ ! "$modname" =~ ^[A-Za-z0-9_-]+$ ]]; do
+        modname="$(dlg_input "$(L '허용 정책 생성 — 잘못된 이름' 'Generate allow policy — invalid name')" \
+            "$(L "모듈 이름에는 영문자/숫자/밑줄(_)/하이픈(-)만 사용할 수 있습니다.\n(경로 문자 '/', '..' 등은 사용할 수 없음)\n\n다시 입력하세요. 예) mywebfix" \
+                 "Module name may only contain letters, digits, underscore(_) or hyphen(-).\n(Path characters like '/', '..' are not allowed)\n\nEnter it again. e.g. mywebfix")")" || { rm -f "$denials"; return; }
+        [[ -z "$modname" ]] && { rm -f "$denials"; return; }
+    done
+
+    # Use the same denial records (file) for the preview and the real run, so new denials cannot slip in between
+    audit2allow -m "$modname" <"$denials" >"$TMP_OUT" 2>&1
+    flush_input
+    dialog --backtitle "$BACKTITLE" --exit-label "$(L '닫기' 'Close')" --title "$(L '생성될 정책 미리보기' 'Policy preview') ($modname.te)" \
+        --textbox "$TMP_OUT" "$DLG_H" "$DLG_W"
+
+    if yesno "$(L '확인' 'Confirm')" "$(L '위 정책을 실제로 컴파일하여 시스템에 적용할까요?' 'Compile and apply this policy to the system?')\n\n  $(L '모듈' 'module'): $modname\n\n$(L '(주의: allow 줄이 해결하려는 프로그램에 대한 것인지\n 미리보기에서 꼭 확인하세요)' '(Caution: check in the preview that the allow lines\n are only for the program you are fixing)')" 12; then
+        local wd; wd="$(mktemp -d /tmp/secpanel-se.XXXXXX)"
+        (
+            cd "$wd" || exit 1
+            audit2allow -M "$modname" <"$denials" >/dev/null || exit 1
+            semodule -i "${modname}.pp"
+        ) >"$TMP_OUT" 2>&1
+        local rc=$?
+        rm -rf "$wd"
+        if [[ $rc -eq 0 ]]; then
+            msg "$(L '허용 정책 적용 — 성공' 'Apply allow policy — OK')" "$(L "정책 모듈 '$modname' 을 시스템에 적용했습니다.\n재부팅 후에도 유지됩니다.\n\n되돌리려면: SELinux 관리 → 설치된 정책 모듈 삭제\n(또는 semodule -r $modname)" "Policy module '$modname' has been applied.\nIt persists across reboots.\n\nTo undo: SELinux → Remove installed policy module\n(or semodule -r $modname)")\n\n$(cat "$TMP_OUT")" 14
+        else
+            msg "$(L '허용 정책 적용 — 실패' 'Apply allow policy — Failed')" "$(cat "$TMP_OUT")"
+        fi
+    fi
+    rm -f "$denials"
+}
+
+se_module_del() {
+    # Show only modules installed by the user with semodule -i / audit2allow (priority 400).
+    # Removing base (100) or package (200) modules can break services, so they are not listed.
+    mapfile -t mods < <(semodule --list-modules=full 2>/dev/null | awk '$1==400{print $2}')
+    if [[ ${#mods[@]} -eq 0 ]]; then
+        msg "$(L '정책 모듈 삭제' 'Remove policy module')" \
+            "$(L "직접 설치한 정책 모듈이 없습니다.\n\n(시스템 기본 모듈은 실수로 지우지 않도록 목록에 표시하지 않습니다)" \
+                 "No user-installed policy modules.\n\n(System modules are hidden to prevent accidental removal)")" 10
+        return
+    fi
+    local args=() m
+    for m in "${mods[@]}"; do args+=("$m" "$(L '직접 설치한 모듈' 'user-installed')"); done
+    local mod
+    mod="$(dlg --title "$(L '정책 모듈 삭제' 'Remove policy module')" --menu \
+        "$(L '삭제할 정책 모듈을 선택하세요.\n(직접 설치한 모듈만 표시됩니다)' 'Select a policy module to remove.\n(Only user-installed modules are shown)')" \
+        "$DLG_H" "$DLG_W" "$MENU_H" "${args[@]}")" || return
+    if yesno "$(L '확인' 'Confirm')" "$(L '정책 모듈을 삭제합니다.' 'Remove policy module.') ($mod)\n\n$(L '진행할까요?' 'Proceed?')"; then
+        run_show "$(L '정책 모듈 삭제' 'Remove policy module')" semodule -r "$mod"
+    fi
+}
+
+selinux_menu() {
+    if ! need_cmd getenforce; then
+        msg "SELinux" "$(L 'SELinux 유틸리티가 없습니다. (dnf install libselinux-utils policycoreutils-python-utils)' 'SELinux utilities not found. (dnf install libselinux-utils policycoreutils-python-utils)')"
+        return
+    fi
+    while true; do
+        local choice
+        choice="$(dlg --title "$(L 'SELinux 관리' 'SELinux management')" --cancel-label "$(L '뒤로' 'Back')" \
+            --menu "$(L '원하는 작업을 선택하세요.' 'Choose an action.')\n$(L '현재 모드' 'Current mode'): $(getenforce)" \
+            "$DLG_H" "$DLG_W" "$MENU_H" \
+            1  "$(L '상태 보기 (전체 요약)' 'View status (summary)')" \
+            2  "$(L '동작 모드 전환 (Enforcing/Permissive)' 'Switch mode (Enforcing/Permissive)')" \
+            3  "$(L '포트 정책 보기' 'View port policies')" \
+            4  "$(L '포트 정책 추가 (허용)' 'Add port policy (allow)')" \
+            5  "$(L '포트 정책 삭제' 'Remove port policy')" \
+            6  "$(L 'Boolean 스위치 보기' 'View Booleans')" \
+            7  "$(L 'Boolean 스위치 변경' 'Change Boolean')" \
+            8  "$(L '파일 컨텍스트 보기' 'View file contexts')" \
+            9  "$(L '파일 컨텍스트 추가' 'Add file context')" \
+            10 "$(L '파일 컨텍스트 삭제' 'Remove file context')" \
+            11 "$(L '거부로그로 허용정책 자동생성 (audit2allow)' 'Auto-generate allow policy (audit2allow)')" \
+            12 "$(L '설치된 정책 모듈 삭제' 'Remove installed policy module')")" || return
+        case "$choice" in
+            1)  se_status ;;
+            2)  se_toggle_mode ;;
+            3)  se_port_view ;;
+            4)  se_port_add ;;
+            5)  se_port_del ;;
+            6)  se_bool_view ;;
+            7)  se_bool_set ;;
+            8)  se_fcontext_view ;;
+            9)  se_fcontext_add ;;
+            10) se_fcontext_del ;;
+            11) se_audit2allow ;;
+            12) se_module_del ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Lockout guard (wraps secpanel-guard)
+# ---------------------------------------------------------------------------
+guard_menu() {
+    if ! need_cmd secpanel-guard; then
+        msg "$(L '안전장치(가드)' 'Lockout guard')" "$(L 'secpanel-guard 가 설치되어 있지 않습니다.' 'secpanel-guard is not installed.')"
+        return
+    fi
+    while true; do
+        local status_line choice
+        status_line="$(secpanel-guard status 2>/dev/null | head -1)"
+        choice="$(dlg --title "$(L '작업 안전장치 (원격 락아웃 방지)' 'Lockout guard')" --cancel-label "$(L '뒤로' 'Back')" \
+            --menu "$(L '방화벽/네트워크/sshd 를 위험하게 바꾸기 전에 켜두면,\n확정 안 할 시 자동으로 원상복구됩니다.' \
+                       'Arm before risky firewall/network/sshd changes;\nif not confirmed, it auto-reverts.')\n\n$(L '현재' 'Now'): ${status_line}" \
+            "$DLG_H" "$DLG_W" "$MENU_H" \
+            1 "$(L '안전장치 켜기 (arm) — 스냅샷 + 자동 롤백 예약' 'Arm — snapshot + schedule auto-rollback')" \
+            2 "$(L '확정 (ok) — 접속 정상, 자동 롤백 취소' 'Confirm (ok) — cancel auto-rollback')" \
+            3 "$(L '상태 보기' 'View status')" \
+            4 "$(L '지금 즉시 롤백' 'Roll back now')" \
+            5 "$(L '기록 보기 (켬·확정·원복 이력)' 'View history (arm / confirm / rollback)')")" || return
+        case "$choice" in
+            1)
+                local t note tsel targets
+                tsel="$(dlg --title "$(L '가드 대상 선택' 'Select guard targets')" --checklist \
+                    "$(L '스냅샷 + 자동복구할 대상을 고르세요. (스페이스로 선택)' 'Choose targets to snapshot + auto-restore. (Space to select)')" \
+                    14 "$DLG_W" 3 \
+                    firewall "$(L '방화벽(firewalld) 규칙' 'Firewall (firewalld) rules')" on \
+                    sshd     "$(L 'SSH 서버 설정(sshd_config)' 'SSH server config (sshd_config)')" off \
+                    network  "$(L '네트워크(NetworkManager) 연결' 'Network (NetworkManager) connections')" off)" || continue
+                targets="$(echo "$tsel" | tr -d '"' | tr ' ' ',')"
+                [[ -z "$targets" ]] && { msg "$(L '안전장치' 'Guard')" "$(L '대상을 하나 이상 선택하세요.' 'Select at least one target.')"; continue; }
+                t="$(dlg_input "$(L '안전장치 켜기' 'Arm guard')" \
+                    "$(L "자동 롤백까지의 시간(초)을 입력하세요. (30 ~ 3600)\n이 시간 안에 '확정'하지 않으면 자동 원복됩니다.\n예) 300 = 5분" \
+                         "Seconds until auto-rollback. (30 - 3600)\nIf not confirmed within this time, it auto-reverts.\ne.g. 300 = 5 minutes")" "300")" || continue
+                if ! [[ "$t" =~ ^[0-9]+$ ]] || (( t < 30 || t > 3600 )); then
+                    msg "$(L '안전장치 켜기' 'Arm guard')" "$(L "'$t' 는 사용할 수 없는 값입니다.\n30 ~ 3600 사이의 숫자(초)로 입력하세요." "'$t' is not allowed.\nEnter a number of seconds between 30 and 3600.")" 9
+                    continue
+                fi
+                note="$(dlg_input "$(L '메모(선택)' 'Note (optional)')" "$(L '무슨 작업인지 메모 (선택)' 'What are you doing? (optional)')")" || note=""
+                run_show "$(L '안전장치 켜기' 'Arm guard')" secpanel-guard arm --timeout "$t" --targets "$targets" --note "$note"
+                ;;
+            2) run_show "$(L '확정(ok)' 'Confirm (ok)')" secpanel-guard ok ;;
+            3) show_text "$(L '가드 상태' 'Guard status')" secpanel-guard status ;;
+            4) if yesno "$(L '즉시 롤백' 'Roll back now')" "$(L '지금 즉시 스냅샷 상태로 되돌립니다.\n진행할까요?' 'Revert to the snapshot state now.\nProceed?')"; then
+                   run_show "$(L '즉시 롤백' 'Roll back now')" secpanel-guard rollback
+               fi ;;
+            5) show_text "$(L '작업 안전장치 기록' 'Guard history')" secpanel-guard log ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Backup - files and folders / MariaDB
+# ---------------------------------------------------------------------------
+BK_CONF="/etc/secpanel/backup.conf"
+BK_HIST="/var/log/secpanel-backup.log"   # file backup history (time<TAB>source<TAB>backup)
+
+# Default settings (bk_load overrides them when backup.conf exists)
+BK_DB_HOME="/usr"                         # MariaDB install path (bin/mariadb-dump under it is used)
+BK_DB_USER="root"
+BK_DB_PASS=""                             # empty = connect without a password
+BK_DB_NAME=""                             # empty = all databases
+BK_DB_DIR="/tmp/backup/db"                # where DB dumps are stored
+BK_DB_KEEP_DAYS="30"                      # 0 = never delete
+BK_DEST_MODE="same"                       # same = next to the original, dir = BK_DEST_DIR
+BK_DEST_DIR="/tmp/backup/files"
+BK_SUFFIX='_$today'                       # $today → YYYYMMDD, $time → HHMMSS
+BK_EXISTS="ask"                           # ask | number | overwrite | skip
+BK_DB_COMPRESS="yes"                      # yes = .sql.gz, no = .sql
+BK_TAR="no"                               # yes = bundle several selected items into one tar file
+BK_SCHED="off"                            # scheduled DB backup: off | daily | weekly | monthly
+BK_SCHED_DOW="Mon"                        # weekday for weekly (Mon..Sun)
+BK_SCHED_DOM="1"                          # day for monthly (1-28) or last (last day of the month)
+BK_SCHED_TIME="03:00"                     # time of day HH:MM
+BK_UNIT="secpanel-dbbackup"               # systemd unit name of the scheduled backup
+
+declare -A BK_SEL=()    # paths picked in the file browser (an empty value means unselected)
+declare -A BK_USED=()   # backup paths already created in this run
+
+# The settings file is never executed; it is read line by line (key=value) - safe even with special characters in the password
+# Read package defaults first, then the settings saved by the user (the later one wins)
+bk_load() { bk_load_file "$VENDOR_DEFAULTS"; bk_load_file "$BK_CONF"; }
+bk_load_file() {
+    [[ -r "$1" ]] || return 0
+    local k v
+    while IFS='=' read -r k v; do
+        case "$k" in
+            DB_HOME)      BK_DB_HOME="$v" ;;
+            DB_USER)      BK_DB_USER="$v" ;;
+            DB_PASS)      BK_DB_PASS="$v" ;;
+            DB_NAME)      BK_DB_NAME="$v" ;;
+            DB_DIR)       BK_DB_DIR="$v" ;;
+            DB_KEEP_DAYS) [[ "$v" =~ ^[0-9]{1,4}$ ]] && BK_DB_KEEP_DAYS="$v" ;;
+            DEST_MODE)    [[ "$v" == same || "$v" == dir ]] && BK_DEST_MODE="$v" ;;
+            DEST_DIR)     BK_DEST_DIR="$v" ;;
+            SUFFIX)       BK_SUFFIX="$v" ;;
+            EXISTS)       [[ "$v" =~ ^(ask|number|overwrite|skip)$ ]] && BK_EXISTS="$v" ;;
+            DB_COMPRESS)  [[ "$v" == yes || "$v" == no ]] && BK_DB_COMPRESS="$v" ;;
+            TAR)          [[ "$v" == yes || "$v" == no ]] && BK_TAR="$v" ;;
+            SCHED)        [[ "$v" =~ ^(off|daily|weekly|monthly)$ ]] && BK_SCHED="$v" ;;
+            SCHED_DOW)    [[ "$v" =~ ^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)$ ]] && BK_SCHED_DOW="$v" ;;
+            SCHED_DOM)    [[ "$v" =~ ^([1-9]|1[0-9]|2[0-8]|last)$ ]] && BK_SCHED_DOM="$v" ;;
+            SCHED_TIME)   [[ "$v" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] && BK_SCHED_TIME="$v" ;;
+        esac
+    done <"$1"
+}
+
+# Safety check for a backup folder under a world-writable folder (such as /tmp).
+# If another account creates a folder or a link on that path first, root could write the backup
+# to the wrong place or hand its contents to that account. So every component below a
+# world-writable folder must be owned by root, not writable by others, and not a link. Prints the reason and returns 1 on a problem.
+bk_dir_safe() {
+    local c="$1" b mode owner
+    local -a below=()
+    while [[ -n "$c" && "$c" != "/" ]]; do
+        if [[ -e "$c" || -L "$c" ]]; then
+            mode="$(stat -L -c %a -- "$c" 2>/dev/null)"; mode="${mode: -4}"
+            if [[ ! -L "$c" && -d "$c" ]] && (( 8#${mode:-0} & 8#0002 )); then
+                if (( ! ( 8#${mode:-0} & 8#1000 ) )); then
+                    echo "$(L '누구나 쓸 수 있는 폴더라 백업 위치로 쓸 수 없습니다' 'world-writable folder, not safe for backups'): $c"; return 1
+                fi
+                for b in "${below[@]}"; do
+                    owner="$(stat -c %u -- "$b" 2>/dev/null)"; mode="$(stat -c %a -- "$b" 2>/dev/null)"
+                    if [[ -L "$b" ]]; then
+                        echo "$(L '백업 경로에 링크가 끼어 있습니다' 'the backup path contains a symbolic link'): $b"; return 1
+                    elif [[ "$owner" != 0 ]] || (( 8#${mode:-0} & 8#0022 )); then
+                        echo "$(L 'root 가 아닌 계정이 만들었거나 남이 쓸 수 있는 폴더입니다' 'not owned by root, or writable by others'): $b"
+                        echo "$(L "($c 아래는 누구나 폴더를 만들 수 있습니다. 그 폴더를 지우거나 백업 설정에서 다른 위치를 지정하세요)" "(anyone can create folders under $c. Remove that folder or choose another location in Backup settings)")"
+                        return 1
+                    fi
+                done
+                return 0
+            fi
+            below+=("$c")
+        fi
+        c="$(dirname "$c")"
+    done
+    return 0
+}
+
+# Contains the DB password, so save it readable by root only (600)
+bk_save() {
+    local tmp
+    mkdir -p "$(dirname "$BK_CONF")" 2>/dev/null
+    tmp="$(mktemp "${BK_CONF}.XXXXXX")" || return 1
+    chmod 600 "$tmp"
+    {
+        printf 'DB_HOME=%s\n'      "$BK_DB_HOME"
+        printf 'DB_USER=%s\n'      "$BK_DB_USER"
+        printf 'DB_PASS=%s\n'      "$BK_DB_PASS"
+        printf 'DB_NAME=%s\n'      "$BK_DB_NAME"
+        printf 'DB_DIR=%s\n'       "$BK_DB_DIR"
+        printf 'DB_KEEP_DAYS=%s\n' "$BK_DB_KEEP_DAYS"
+        printf 'DEST_MODE=%s\n'    "$BK_DEST_MODE"
+        printf 'DEST_DIR=%s\n'     "$BK_DEST_DIR"
+        printf 'SUFFIX=%s\n'       "$BK_SUFFIX"
+        printf 'EXISTS=%s\n'       "$BK_EXISTS"
+        printf 'DB_COMPRESS=%s\n'  "$BK_DB_COMPRESS"
+        printf 'TAR=%s\n'          "$BK_TAR"
+        printf 'SCHED=%s\n'        "$BK_SCHED"
+        printf 'SCHED_DOW=%s\n'    "$BK_SCHED_DOW"
+        printf 'SCHED_DOM=%s\n'    "$BK_SCHED_DOM"
+        printf 'SCHED_TIME=%s\n'   "$BK_SCHED_TIME"
+    } >"$tmp"
+    mv -f "$tmp" "$BK_CONF"
+}
+
+# Replace $today / $time in the suffix with real values (plain text substitution, not shell expansion)
+bk_suffix() {
+    local s="$BK_SUFFIX"
+    s="${s//\$today/$(date +%Y%m%d)}"
+    s="${s//\$time/$(date +%H%M%S)}"
+    printf '%s' "$s"
+}
+
+bk_exists_label() {
+    case "${1:-$BK_EXISTS}" in
+        ask)       L '매번 묻기' 'Ask each time' ;;
+        number)    L '번호 붙여 새로 만들기 (_1, _2 …)' 'Add a number (_1, _2 …)' ;;
+        overwrite) L '덮어쓰기' 'Overwrite' ;;
+        skip)      L '건너뛰기' 'Skip' ;;
+    esac
+}
+bk_dest_label() {
+    if [[ "$BK_DEST_MODE" == dir ]]; then printf '%s' "$BK_DEST_DIR"
+    else L '원본과 같은 위치' 'Same folder as the original'; fi
+}
+bk_onoff_label() { if [[ "$1" == yes ]]; then L '켜짐' 'on'; else L '꺼짐' 'off'; fi; }
+bk_dbname_label() { if [[ -n "$BK_DB_NAME" ]]; then printf '%s' "$BK_DB_NAME"; else L '(전체 DB)' '(all databases)'; fi; }
+
+valid_abs_dir() { [[ "$1" == /* && "$1" != "/" && "$1" != *$'\n'* ]]; }
+
+# --- settings --------------------------------------------------------------
+bk_settings() {
+    local choice v pw
+    while true; do
+        if [[ -n "$BK_DB_PASS" ]]; then pw="$(L '(설정됨)' '(set)')"; else pw="$(L '(없음)' '(none)')"; fi
+        choice="$(dlg --title "$(L '백업 설정' 'Backup settings')" --cancel-label "$(L '뒤로' 'Back')" \
+            --menu "$(L '바꿀 항목을 선택하세요. 바꾸면 바로 저장됩니다.' 'Select an item to change. Changes are saved immediately.')" \
+            "$DLG_H" "$DLG_W" "$MENU_H" \
+            1 "$(L 'DB 설치 경로' 'DB install path')        : $BK_DB_HOME" \
+            2 "$(L 'DB 계정' 'DB user')             : $BK_DB_USER" \
+            3 "$(L 'DB 비밀번호' 'DB password')         : $pw" \
+            4 "$(L '백업할 DB 이름' 'Database name')      : $(bk_dbname_label)" \
+            5 "$(L 'DB 백업 저장 위치' 'DB backup folder')   : $BK_DB_DIR" \
+            6 "$(L 'DB 백업 보관 기간' 'DB backup retention')   : $( (( BK_DB_KEEP_DAYS > 0 )) && echo "${BK_DB_KEEP_DAYS}$(L '일' ' days')" || L '지우지 않음' 'keep forever')" \
+            7 "$(L 'DB 백업 압축(.gz)' 'DB backup gzip')   : $(bk_onoff_label "$BK_DB_COMPRESS")" \
+            8 "$(L '파일 백업 저장 위치' 'File backup folder') : $(bk_dest_label)" \
+            9 "$(L '백업 이름 뒤 문자열' 'Backup name suffix') : ${BK_SUFFIX:-$(L '(없음)' '(none)')}" \
+            10 "$(L '같은 이름이 있을 때' 'If it already exists') : $(bk_exists_label)" \
+            11 "$(L '여러 개는 tar 로 묶기' 'Bundle many into tar') : $(bk_onoff_label "$BK_TAR")")" || return
+        case "$choice" in
+            1) v="$(dlg_input "$(L 'DB 설치 경로' 'DB install path')" \
+                    "$(L 'MariaDB 가 설치된 경로를 입력하세요.\n(이 경로 아래 bin/mariadb-dump 를 사용합니다)' \
+                         'Enter the MariaDB install path.\n(bin/mariadb-dump under this path is used)')" "$BK_DB_HOME")" || continue
+               v="${v%/}"
+               if valid_abs_dir "$v"; then BK_DB_HOME="$v"; bk_save
+                   bk_dump_bin >/dev/null || msg "$(L '[주의] MariaDB 를 찾지 못함' '[CAUTION] MariaDB not found')" \
+                       "$(L '설정은 저장했지만, 이 경로에서 mariadb-dump 를 찾지 못했습니다.' 'Saved, but mariadb-dump was not found under this path.')\n\n  $v/bin/" 10
+               else msg "$(L '입력 오류' 'Invalid input')" "$(L '/ 로 시작하는 경로를 입력하세요.' 'Enter an absolute path starting with /.')" 8; fi ;;
+            2) v="$(dlg_input "$(L 'DB 계정' 'DB user')" "$(L '덤프에 사용할 DB 계정을 입력하세요.' 'Enter the DB user for the dump.')" "$BK_DB_USER")" || continue
+               if [[ -n "$v" && "$v" != *[[:space:]]* ]]; then BK_DB_USER="$v"; bk_save
+               else msg "$(L '입력 오류' 'Invalid input')" "$(L '계정 이름을 공백 없이 입력하세요.' 'Enter a user name without spaces.')" 8; fi ;;
+            3) v="$(dlg --title "$(L 'DB 비밀번호' 'DB password')" --insecure \
+                    --passwordbox "$(L '비밀번호를 입력하세요. (입력한 글자는 * 로 표시)\n비밀번호가 없는 계정이면 비워 두고 확인을 누르세요.\n\n저장 위치: ' \
+                                       'Enter the password (shown as *).\nLeave empty if the account has no password.\n\nStored in: ')${BK_CONF} $(L '(root 만 읽기 가능)' '(root-only)')" \
+                    13 "$DLG_W")" || continue
+               if [[ "$v" == *$'\n'* ]]; then msg "$(L '입력 오류' 'Invalid input')" "$(L '줄바꿈은 쓸 수 없습니다.' 'Line breaks are not allowed.')" 8
+               else BK_DB_PASS="$v"; bk_save; fi ;;
+            4) v="$(dlg_input "$(L '백업할 DB 이름' 'Database name')" \
+                    "$(L '덤프할 DB 이름을 입력하세요. 여러 개는 공백으로 구분합니다.\n비워 두면 전체 DB 를 한 파일로 백업합니다.' \
+                         'Enter database name(s), separated by spaces.\nLeave empty to dump all databases into one file.')" "$BK_DB_NAME")" || continue
+               v="$(printf '%s' "$v" | xargs 2>/dev/null)"
+               if [[ -z "$v" || "$v" =~ ^[A-Za-z0-9_$-]+(\ [A-Za-z0-9_$-]+)*$ ]]; then BK_DB_NAME="$v"; bk_save
+               else msg "$(L '입력 오류' 'Invalid input')" "$(L 'DB 이름은 영문/숫자/_/-/$ 만 쓸 수 있습니다.' 'Use only letters, digits, _, - and $.')" 8; fi ;;
+            5) v="$(dlg_input "$(L 'DB 백업 저장 위치' 'DB backup folder')" \
+                    "$(L 'DB 덤프 파일(.sql.gz)을 저장할 폴더를 입력하세요. 없으면 만듭니다.' 'Folder for dump files (.sql.gz). Created if missing.')" "$BK_DB_DIR")" || continue
+               v="${v%/}"
+               if valid_abs_dir "$v"; then BK_DB_DIR="$v"; bk_save
+               else msg "$(L '입력 오류' 'Invalid input')" "$(L '/ 로 시작하는 폴더 경로를 입력하세요. ( / 자체는 안 됩니다)' 'Enter an absolute folder path (not / itself).')" 8; fi ;;
+            6) v="$(dlg_input "$(L 'DB 백업 보관 기간' 'DB backup retention')" \
+                    "$(L '며칠 동안 보관할지 숫자로 입력하세요. (0 = 지우지 않음)\n이 기간이 지난 DB 백업 파일은 다음 DB 백업이 성공한 뒤 지웁니다.' \
+                         'Days to keep (0 = keep forever).\nOlder DB backup files are removed after the next successful DB backup.')" "$BK_DB_KEEP_DAYS")" || continue
+               if [[ "$v" =~ ^[0-9]{1,4}$ ]]; then BK_DB_KEEP_DAYS="$((10#$v))"; bk_save
+               else msg "$(L '입력 오류' 'Invalid input')" "$(L '0~9999 사이 숫자를 입력하세요.' 'Enter a number between 0 and 9999.')" 8; fi ;;
+            7) v="$(dlg --title "$(L 'DB 백업 압축' 'DB backup compression')" --default-item "$BK_DB_COMPRESS" \
+                    --menu "$(L 'DB 덤프를 gzip 으로 압축할까요?\n압축하면 보통 1/5~1/10 크기가 되고, 끄면 바로 열어 볼 수 있는 .sql 로 저장합니다.' \
+                               'Compress DB dumps with gzip?\nCompressed dumps are usually 5-10x smaller; off saves plain .sql.')" 12 "$DLG_W" 2 \
+                    yes "$(L '켜짐 — DB이름_날짜_시각.sql.gz' 'on  — name_date_time.sql.gz')" \
+                    no  "$(L '꺼짐 — DB이름_날짜_시각.sql' 'off — name_date_time.sql')")" || continue
+               BK_DB_COMPRESS="$v"; bk_save ;;
+            11) v="$(dlg --title "$(L '여러 개는 tar 로 묶기' 'Bundle many into tar')" --default-item "$BK_TAR" \
+                    --menu "$(L '파일·폴더를 2개 이상 골랐을 때 tar 파일 하나로 묶어 보관할까요?\n(1개만 고르면 이 설정과 상관없이 그대로 복사합니다)' \
+                               'When 2 or more items are selected, bundle them into one tar file?\n(A single item is always copied as is)')" 12 "$DLG_W" 2 \
+                    yes "$(L '켜짐 — backup<뒤 문자열>.tar 하나로 묶음' 'on  — one backup<suffix>.tar')" \
+                    no  "$(L '꺼짐 — 항목마다 따로 복사' 'off — copy each item separately')")" || continue
+               BK_TAR="$v"; bk_save ;;
+            8) v="$(dlg --title "$(L '파일 백업 저장 위치' 'File backup folder')" --default-item "$BK_DEST_MODE" \
+                    --menu "$(L '파일·폴더 백업본을 어디에 둘까요?' 'Where should file/folder backups go?')" 11 "$DLG_W" 2 \
+                    same "$(L '원본과 같은 위치 (예: /etc/a.conf → /etc/a.conf_날짜)' 'Same folder as the original')" \
+                    dir  "$(L '폴더를 지정 (모든 백업본을 한 폴더에)' 'A folder I specify')")" || continue
+               if [[ "$v" == dir ]]; then
+                   v="$(dlg_input "$(L '파일 백업 저장 위치' 'File backup folder')" \
+                        "$(L '백업본을 모아 둘 폴더를 입력하세요. 없으면 만듭니다.' 'Folder to collect backups in. Created if missing.')" "$BK_DEST_DIR")" || continue
+                   v="${v%/}"
+                   if valid_abs_dir "$v"; then BK_DEST_DIR="$v"; BK_DEST_MODE="dir"; bk_save
+                   else msg "$(L '입력 오류' 'Invalid input')" "$(L '/ 로 시작하는 폴더 경로를 입력하세요. ( / 자체는 안 됩니다)' 'Enter an absolute folder path (not / itself).')" 8; fi
+               else BK_DEST_MODE="same"; bk_save; fi ;;
+            9) v="$(dlg_input "$(L '백업 이름 뒤 문자열' 'Backup name suffix')" \
+                    "$(L '백업본 이름 뒤에 붙일 문자열을 입력하세요.\n  $today = 오늘 날짜(YYYYMMDD),  $time = 현재 시각(HHMMSS)\n예) _$today  →  server.xml_20261001' \
+                         'Text appended to the backup name.\n  $today = date (YYYYMMDD),  $time = time (HHMMSS)\ne.g. _$today  ->  server.xml_20261001')" "$BK_SUFFIX")" || continue
+               if [[ "$v" == */* || "$v" == *$'\n'* ]]; then
+                   msg "$(L '입력 오류' 'Invalid input')" "$(L '/ 는 쓸 수 없습니다.' '/ is not allowed.')" 8
+               elif [[ -z "$v" && "$BK_DEST_MODE" == same ]]; then
+                   msg "$(L '입력 오류' 'Invalid input')" "$(L '저장 위치가 "원본과 같은 위치"일 때는 비워 둘 수 없습니다.\n(백업본 이름이 원본과 같아집니다)' 'Cannot be empty when backups go to the same folder as the original.')" 9
+               else BK_SUFFIX="$v"; bk_save; fi ;;
+            10) v="$(dlg --title "$(L '같은 이름이 있을 때' 'If it already exists')" --default-item "$BK_EXISTS" \
+                    --menu "$(L '같은 이름의 백업본이 이미 있으면 어떻게 할까요?' 'What if a backup with the same name already exists?')" 13 "$DLG_W" 4 \
+                    ask       "$(bk_exists_label ask)" \
+                    number    "$(bk_exists_label number)" \
+                    overwrite "$(bk_exists_label overwrite)" \
+                    skip      "$(bk_exists_label skip)")" || continue
+               BK_EXISTS="$v"; bk_save ;;
+        esac
+    done
+}
+
+# --- file browser -----------------------------------------------------------
+bk_hsize() {  # bytes -> human readable size (result in REPLY)
+    local n="$1"
+    if   (( n < 1024 ));       then REPLY="$n"
+    elif (( n < 1048576 ));    then REPLY="$(( n / 1024 ))K"
+    elif (( n < 1073741824 )); then REPLY="$(( n / 1048576 ))M"
+    else                            REPLY="$(( n / 1073741824 ))G"; fi
+}
+
+bk_sel_count() {
+    local p n=0
+    for p in "${!BK_SEL[@]}"; do [[ -n "${BK_SEL[$p]}" ]] && (( n++ )); done
+    echo "$n"
+}
+
+# Arrow keys move, Space selects, Enter opens a folder. Selections are kept while moving between folders.
+# Symbolic links are not backed up, so they are not listed.
+# Returns: 0 = start the backup, 1 = cancel
+bk_browse() {
+    local cur="$1" focus="" rows cols H W LH out rc
+    local typ size mt own mode name tag info full cur_tag line inside p other
+    local -a args tags lines
+    while true; do
+        read -r rows cols < <(stty size 2>/dev/null)
+        [[ "$rows" =~ ^[0-9]+$ ]] || rows=24
+        [[ "$cols" =~ ^[0-9]+$ ]] || cols=80
+        H=$(( rows - 3 )); (( H < 18 )) && H=18
+        W=$(( cols - 4 )); (( W > 110 )) && W=110
+        LH=$(( H - 10 ))
+
+        args=(); tags=()
+        [[ "$cur" != "/" ]] && args+=(".." "$(L '[ 상위 폴더로 ]' '[ parent folder ]')" off)
+        while IFS=$'\t' read -r -d '' typ size mt own mode name; do
+            full="${cur%/}/$name"
+            if [[ "$typ" == d ]]; then
+                tag="$name/"
+                printf -v info '%6s %-8s %4s %s' '<DIR>' "$own" "$mode" "$mt"
+            else
+                tag="$name"
+                bk_hsize "$size"
+                printf -v info '%6s %-8s %4s %s' "$REPLY" "$own" "$mode" "$mt"
+            fi
+            tags+=("$tag")
+            if [[ -n "${BK_SEL[$full]:-}" ]]; then args+=("$tag" "$info" on); else args+=("$tag" "$info" off); fi
+        done < <(find "$cur" -mindepth 1 -maxdepth 1 \( -type d -o -type f \) ! -name $'*\n*' ! -name $'*\t*' \
+                     -printf '%y\t%s\t%Ty-%Tm-%Td\t%u\t%m\t%f\0' 2>/dev/null | LC_ALL=C sort -z -t $'\t' -k1,1 -k6)
+        if (( ${#args[@]} == 0 )); then args+=(".." "$(L '[ 상위 폴더로 ]' '[ parent folder ]')" off); fi
+
+        inside=""
+        for p in "${!BK_SEL[@]}"; do
+            [[ -n "${BK_SEL[$p]}" && ( "$cur" == "$p" || "$cur" == "$p"/* ) ]] && { inside="$p"; break; }
+        done
+        other=0
+        for p in "${!BK_SEL[@]}"; do
+            [[ -n "${BK_SEL[$p]}" && "$(dirname "$p")" != "$cur" ]] && (( other++ ))
+        done
+        info="$(L '위치' 'Path'): $cur\n"
+        if [[ -n "$inside" ]]; then info+="$(L '※ 이 폴더는 통째로 선택되어 있습니다 (안의 파일을 따로 고를 필요 없음)' '* this whole folder is already selected')"
+        elif (( other > 0 )); then info+="$(L '다른 위치에서 선택해 둔 항목' 'Selected in other folders'): ${other}$(L '개 (유지됨)' ' (kept)')"
+        else info+="$(L '[*] 표시한 항목이 백업됩니다. 폴더를 표시하면 안의 파일까지 모두 백업됩니다.' 'Items marked [*] are backed up. A marked folder includes everything inside.')"; fi
+        info+="\n$(L '[↑↓] 이동  [Space] 선택/해제  [Enter] 폴더 열기  [Tab] 버튼으로 이동' \
+                     '[Up/Down] move  [Space] select  [Enter] open folder  [Tab] buttons')"
+
+        flush_input
+        out="$(dialog --backtitle "$BACKTITLE" --title "$(L '백업할 파일·폴더 선택' 'Select files/folders to back up')" \
+            --separate-output --help-status \
+            --ok-label "$(L '백업 시작' 'Back up')" \
+            --extra-button --extra-label "$(L '경로 입력' 'Go to path')" \
+            --cancel-label "$(L '취소' 'Cancel')" \
+            --help-button --help-label "$(L '열기' 'Open')" \
+            --default-button help ${focus:+--default-item "$focus"} \
+            --checklist "$info" "$H" "$W" "$LH" "${args[@]}" 3>&1 1>&2 2>&3)"
+        rc=$?
+        (( rc == 0 || rc == 2 || rc == 3 )) || return 1
+
+        mapfile -t lines <<<"$out"
+        cur_tag=""
+        if (( rc == 2 )); then cur_tag="${lines[0]#HELP }"; lines=("${lines[@]:1}"); fi
+        # apply the check marks on this screen to the selection list
+        for tag in "${tags[@]}"; do BK_SEL["${cur%/}/${tag%/}"]=""; done
+        for line in "${lines[@]}"; do
+            [[ -z "$line" || "$line" == ".." ]] && continue
+            BK_SEL["${cur%/}/${line%/}"]=1
+        done
+
+        case "$rc" in
+            0)  if (( $(bk_sel_count) == 0 )); then
+                    msg "$(L '선택된 항목 없음' 'Nothing selected')" \
+                        "$(L '백업할 파일이나 폴더에서 Space 를 눌러 [*] 표시를 한 뒤\n<백업 시작> 을 누르세요.' \
+                             'Press Space on files or folders to mark them [*],\nthen choose <Back up>.')" 9
+                    continue
+                fi
+                return 0 ;;
+            3)  line="$(dlg_input "$(L '경로 입력' 'Go to path')" "$(L '이동할 폴더 경로를 입력하세요.' 'Enter a folder path to go to.')" "$cur")" || continue
+                if [[ -d "$line" ]]; then cur="$(cd "$line" && pwd -P)"; focus=""
+                else msg "$(L '입력 오류' 'Invalid input')" "$(L '폴더가 없습니다:' 'No such folder:')\n  $line" 8; fi ;;
+            2)  case "$cur_tag" in
+                    "..") focus="$(basename "$cur")/"; cur="$(dirname "$cur")" ;;
+                    */)   cur="${cur%/}/${cur_tag%/}"; focus="" ;;
+                    "")   ;;
+                    *)    full="${cur%/}/$cur_tag"   # Enter on a file = select / unselect
+                          if [[ -n "${BK_SEL[$full]:-}" ]]; then BK_SEL["$full"]=""; else BK_SEL["$full"]=1; fi
+                          focus="$cur_tag" ;;
+                esac ;;
+        esac
+    done
+}
+
+# --- run a file / folder backup ----------------------------------------------
+# $1=source. Puts a result line in BK_MSG and returns 0=ok 1=failed 2=skipped 3=stop all.
+# cp -a preserves owner, group, mode, timestamps and SELinux label.
+bk_copy_one() {
+    local src="$1" base destdir dest part policy n a b lnk ldir
+    base="$(basename "$src")"
+    if [[ "$BK_DEST_MODE" == dir ]]; then destdir="$BK_DEST_DIR"; else destdir="$(dirname "$src")"; fi
+    if [[ -d "$src" && ( "$destdir" == "$src" || "$destdir" == "$src"/* ) ]]; then
+        BK_MSG="$(L '실패' 'FAILED')  $src\n        $(L '저장 위치가 이 폴더 안에 있어 백업할 수 없습니다' 'the backup folder is inside this folder'): $destdir"
+        return 1
+    fi
+    if ! bk_dir_safe "$destdir" >"$TMP_DIR/cp.err" || ! mkdir -p -- "$destdir" 2>>"$TMP_DIR/cp.err" \
+         || ! bk_dir_safe "$destdir" >"$TMP_DIR/cp.err"; then
+        BK_MSG="$(L '실패' 'FAILED')  $src\n        $(head -n 1 "$TMP_DIR/cp.err")"; return 1
+    fi
+    dest="${destdir%/}/${base}${BK_SFX}"
+    if [[ "$dest" == "$src" ]]; then
+        BK_MSG="$(L '실패' 'FAILED')  $src\n        $(L '백업본 이름이 원본과 같습니다 (설정의 뒤 문자열을 확인하세요)' 'backup name equals the original (check the suffix setting)')"
+        return 1
+    fi
+    # Never touch a destination that is a folder containing the source (e.g. overwriting /a/b with something inside /a/b)
+    if [[ "$src" == "$dest"/* ]]; then
+        BK_MSG="$(L '실패' 'FAILED')  $src\n        $(L '백업본 이름이 원본이 들어 있는 폴더와 같습니다' 'backup name equals a folder that contains the original'): $dest"
+        return 1
+    fi
+    if [[ -e "$dest" || -L "$dest" || -n "${BK_USED[$dest]:-}" ]]; then
+        policy="$BK_EXISTS"
+        # Never overwrite a backup created earlier in this run (another source with the same name)
+        [[ -n "${BK_USED[$dest]:-}" ]] && policy="number"
+        if [[ "$policy" == ask ]]; then
+            policy="$(dlg --title "$(L '[주의] 같은 이름의 백업본이 있습니다' '[CAUTION] Backup already exists')" \
+                --cancel-label "$(L '전체 중단' 'Stop all')" \
+                --menu "$dest\n\n$(L '어떻게 할까요?' 'What should be done?')" 14 "$DLG_W" 3 \
+                number    "$(bk_exists_label number)" \
+                overwrite "$(bk_exists_label overwrite)" \
+                skip      "$(bk_exists_label skip)")" || { BK_MSG="$(L '중단' 'STOPPED')  $src"; return 3; }
+        fi
+        case "$policy" in
+            skip)   BK_MSG="$(L '건너뜀' 'SKIPPED') $src\n        $(L '이미 있음' 'already exists'): $dest"; return 2 ;;
+            number) n=1; while [[ -e "${dest}_$n" || -L "${dest}_$n" || -n "${BK_USED[${dest}_$n]:-}" ]]; do (( n++ )); done
+                    dest="${dest}_$n" ;;
+        esac
+    fi
+    # Copy under a temporary name and rename, so a failure never leaves a half-copied backup behind
+    part="${dest}.secpanel-part.$$"
+    rm -rf -- "$part"
+    if ! cp -a -- "$src" "$part" 2>"$TMP_DIR/cp.err"; then
+        rm -rf -- "$part"
+        BK_MSG="$(L '실패' 'FAILED')  $src\n        $(head -n 1 "$TMP_DIR/cp.err")"; return 1
+    fi
+    # Links are not backed up, so remove them. Removing changes the folder mtime, so restore it from the source
+    if [[ -d "$part" ]]; then
+        while IFS= read -r -d '' lnk; do
+            rm -f -- "$lnk"
+            ldir="$(dirname "$lnk")"
+            touch -r "${src}${ldir#"$part"}" -- "$ldir" 2>/dev/null
+        done < <(find "$part" -type l -print0 2>/dev/null)
+    fi
+    if [[ -e "$dest" || -L "$dest" ]]; then rm -rf -- "$dest"; fi
+    if ! mv -T -- "$part" "$dest" 2>"$TMP_DIR/cp.err"; then
+        rm -rf -- "$part"
+        BK_MSG="$(L '실패' 'FAILED')  $src\n        $(head -n 1 "$TMP_DIR/cp.err")"; return 1
+    fi
+    BK_USED["$dest"]=1
+    a="$(stat -c '%U:%G %a' -- "$src" 2>/dev/null)"; b="$(stat -c '%U:%G %a' -- "$dest" 2>/dev/null)"
+    BK_MSG="$(L '완료' 'OK')    $src\n     →  $dest\n        $(L '소유자·권한' 'owner/mode'): $b"
+    [[ "$a" != "$b" ]] && BK_MSG+="  $(L '(원본과 다름' '(differs from original'): $a)"
+    logger -t secpanel-backup "file backup: $src -> $dest" 2>/dev/null
+    bk_hist_add "$src" "$dest"
+    return 0
+}
+
+# Bundle several items into one tar file. Arguments = sources. Same return values as bk_copy_one.
+# Paths are stored relative to / (--selinux --acls --xattrs -p) keeping owner, mode and label; links are left out.
+bk_tar_all() {
+    local destdir dest part policy n p common cnt
+    local -a rcs
+    if [[ "$BK_DEST_MODE" == dir ]]; then destdir="$BK_DEST_DIR"
+    else   # common parent folder of the sources
+        common="$(dirname "$1")"
+        for p in "$@"; do
+            while [[ "$common" != "/" && "$p" != "$common"/* ]]; do common="$(dirname "$common")"; done
+        done
+        destdir="$common"
+    fi
+    for p in "$@"; do
+        if [[ -d "$p" && ( "$destdir" == "$p" || "$destdir" == "$p"/* ) ]]; then
+            BK_MSG="$(L '실패' 'FAILED')  $(L 'tar 묶음' 'tar bundle')\n        $(L '저장 위치가 백업할 폴더 안에 있습니다' 'the backup folder is inside a selected folder'): $destdir"
+            return 1
+        fi
+    done
+    if ! bk_dir_safe "$destdir" >"$TMP_DIR/cp.err" || ! mkdir -p -- "$destdir" 2>>"$TMP_DIR/cp.err" \
+         || ! bk_dir_safe "$destdir" >"$TMP_DIR/cp.err"; then
+        BK_MSG="$(L '실패' 'FAILED')  $(L 'tar 묶음' 'tar bundle')\n        $(head -n 1 "$TMP_DIR/cp.err")"; return 1
+    fi
+    dest="${destdir%/}/backup${BK_SFX}.tar"
+    if [[ -e "$dest" || -L "$dest" ]]; then
+        policy="$BK_EXISTS"
+        if [[ "$policy" == ask ]]; then
+            policy="$(dlg --title "$(L '[주의] 같은 이름의 백업본이 있습니다' '[CAUTION] Backup already exists')" \
+                --cancel-label "$(L '전체 중단' 'Stop all')" \
+                --menu "$dest\n\n$(L '어떻게 할까요?' 'What should be done?')" 14 "$DLG_W" 3 \
+                number    "$(bk_exists_label number)" \
+                overwrite "$(bk_exists_label overwrite)" \
+                skip      "$(bk_exists_label skip)")" || { BK_MSG="$(L '중단' 'STOPPED')  $dest"; return 3; }
+        fi
+        case "$policy" in
+            skip)   BK_MSG="$(L '건너뜀' 'SKIPPED') $(L 'tar 묶음' 'tar bundle')\n        $(L '이미 있음' 'already exists'): $dest"; return 2 ;;
+            number) n=1; while [[ -e "${destdir%/}/backup${BK_SFX}_$n.tar" ]]; do (( n++ )); done
+                    dest="${destdir%/}/backup${BK_SFX}_$n.tar" ;;
+        esac
+    fi
+    part="${dest}.secpanel-part.$$"
+    rm -f -- "$part"
+    ( umask 077
+      find "$@" ! -type l -print0 2>>"$TMP_DIR/cp.err" | sed -z 's|^/||' \
+        | tar -C / --null --no-recursion -T - --selinux --acls --xattrs -cpf "$part" 2>"$TMP_DIR/cp.err"
+      exit "${PIPESTATUS[2]}" )
+    n=$?
+    if (( n > 1 )) || [[ ! -s "$part" ]]; then   # tar exit code 1 = a file changed while being read (warning), 2 or more = failure
+        rm -f -- "$part"
+        BK_MSG="$(L '실패' 'FAILED')  $(L 'tar 묶음' 'tar bundle')\n        $(head -n 1 "$TMP_DIR/cp.err")"; return 1
+    fi
+    if ! mv -f -T -- "$part" "$dest" 2>"$TMP_DIR/cp.err"; then
+        rm -f -- "$part"
+        BK_MSG="$(L '실패' 'FAILED')  $(L 'tar 묶음' 'tar bundle')\n        $(head -n 1 "$TMP_DIR/cp.err")"; return 1
+    fi
+    cnt="$(tar -tf "$dest" 2>/dev/null | wc -l)"
+    bk_hsize "$(stat -c %s -- "$dest" 2>/dev/null || echo 0)"
+    BK_MSG="$(L '완료' 'OK')    $#$(L '개 항목을 tar 파일 하나로 묶었습니다' ' items bundled into one tar file')\n     →  $dest\n        $(L '담긴 파일·폴더' 'entries'): ${cnt}$(L '개' ''),  $(L '크기' 'size'): $REPLY\n"
+    for p in "$@"; do
+        BK_MSG+="        - $p\n"
+        logger -t secpanel-backup "file backup (tar): $p -> $dest" 2>/dev/null
+        bk_hist_add "$p" "$dest"
+    done
+    BK_MSG+="\n        $(L '내용 보기' 'List')     : tar -tvf $dest\n        $(L '원래 자리에 풀기' 'Restore in place') : tar -C / -xpf $dest\n        $(L '다른 곳에 풀기' 'Extract elsewhere')  : tar -C <$(L '폴더' 'dir')> -xpf $dest"
+    return 0
+}
+
+bk_files() {
+    local start="/" h p q skip rc i n ok=0 fail=0 skipped=0 list more usetar=0 tarline=""
+    local -a all items
+    bk_load
+    if [[ -z "$BK_SUFFIX" && "$BK_DEST_MODE" == same ]]; then
+        msg "$(L '설정 확인 필요' 'Check settings')" "$(L '백업 이름 뒤 문자열이 비어 있습니다. 백업 설정에서 먼저 지정하세요.' 'The backup name suffix is empty. Set it in Backup settings first.')" 8
+        return
+    fi
+    # Start in the home of the account that ran sudo; root's home (/root) when logged in as root; otherwise /
+    h="$(getent passwd "${SUDO_USER:-root}" 2>/dev/null | cut -d: -f6)"
+    [[ -n "$h" && -d "$h" ]] && start="$h"
+    BK_SEL=(); BK_USED=()
+    bk_browse "$start" || return
+
+    # Tidy the selection: items inside an already selected folder are copied with it, so drop them
+    all=(); items=()
+    while IFS= read -r -d '' p; do all+=("$p"); done < <(
+        for p in "${!BK_SEL[@]}"; do [[ -n "${BK_SEL[$p]}" ]] && printf '%s\0' "$p"; done | LC_ALL=C sort -z)
+    for p in "${all[@]}"; do
+        [[ -e "$p" && ! -L "$p" ]] || continue
+        case "$p" in /proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/run|/run/*)
+            msg "$(L '백업할 수 없는 위치' 'Cannot back up this location')" \
+                "$(L '시스템이 실시간으로 만드는 가상 폴더(/proc, /sys, /dev, /run)는 백업할 수 없어 제외합니다.' \
+                     'Virtual system folders (/proc, /sys, /dev, /run) cannot be backed up and are skipped.')\n\n  $p" 10
+            continue ;;
+        esac
+        skip=0
+        for q in "${items[@]}"; do [[ "$p" == "$q"/* ]] && { skip=1; break; }; done
+        (( skip )) || items+=("$p")
+    done
+    n=${#items[@]}
+    (( n > 0 )) || return
+
+    BK_SFX="$(bk_suffix)"
+    if [[ "$BK_TAR" == yes ]] && (( n > 1 )); then
+        usetar=1
+        tarline="$(L 'tar 로 묶기  :' 'Bundle       :') $(L '켜짐 — backup' 'on — backup')${BK_SFX}.tar $(L '하나로 묶음' '(one file)')\n"
+    fi
+    list=""; i=0
+    for p in "${items[@]}"; do
+        (( i++ )); (( i > 10 )) && break
+        if [[ -d "$p" ]]; then list+="  $p/\n"; else list+="  $p\n"; fi
+    done
+    more=""; (( n > 10 )) && more="  … $(L '외' 'and') $(( n - 10 ))$(L '개' ' more')\n"
+    yesno "$(L '백업 확인' 'Confirm backup')" \
+"$(L '아래' 'Back up') ${n}$(L '개 항목을 백업합니다. 폴더는 안의 파일까지 모두 복사합니다.' ' item(s). Folders are copied with everything inside.')\n\n${list}${more}\n$(L '저장 위치    :' 'Destination  :') $(bk_dest_label)\n$(L '백업본 이름  :' 'Backup name  :') $(L '원본이름' 'name')${BK_SFX}\n$(L '이미 있을 때 :' 'If it exists :') $(bk_exists_label)\n${tarline}\n$(L '소유자·그룹·권한·수정시각은 원본과 똑같이 보존됩니다. 진행할까요?' 'Owner, group, mode and timestamps are preserved. Proceed?')" \
+        "$(( (n > 10 ? 10 : n) + 15 ))" || return
+
+    : >"$TMP_OUT"; i=0
+    if (( usetar )); then
+        dialog --backtitle "$BACKTITLE" --title "$(L '백업 중' 'Backing up')" \
+            --infobox "$(L 'tar 파일로 묶는 중입니다…' 'Bundling into a tar file…')" 5 "$DLG_W"
+        bk_tar_all "${items[@]}"; rc=$?
+        printf '%b\n\n' "$BK_MSG" >>"$TMP_OUT"
+        case "$rc" in 0) ok=$n ;; 1) fail=$n ;; 2) skipped=$n ;; esac
+        items=()
+    fi
+    for p in "${items[@]}"; do
+        (( i++ ))
+        dialog --backtitle "$BACKTITLE" --title "$(L '백업 중' 'Backing up')" \
+            --infobox "($i/$n)\n$p" 6 "$DLG_W"
+        bk_copy_one "$p"; rc=$?
+        printf '%b\n\n' "$BK_MSG" >>"$TMP_OUT"
+        case "$rc" in 0) (( ok++ )) ;; 1) (( fail++ )) ;; 2) (( skipped++ )) ;; 3) break ;; esac
+    done
+    {
+        printf '%s %d   %s %d   %s %d   (%s %d)\n\n' "$(L '완료' 'OK')" "$ok" "$(L '건너뜀' 'Skipped')" "$skipped" \
+            "$(L '실패' 'Failed')" "$fail" "$(L '전체' 'total')" "$n"
+        cat "$TMP_OUT"
+    } | fold -s -w "$((DLG_W-6))" >"$TMP_DIR/bk.result"
+    flush_input
+    dialog --backtitle "$BACKTITLE" --exit-label "$(L '닫기' 'Close')" \
+        --title "$(L '백업 결과' 'Backup result')" --textbox "$TMP_DIR/bk.result" "$DLG_H" "$DLG_W"
+}
+
+# --- file / folder backup history ---------------------------------------------
+bk_hist_add() {  # $1=source $2=backup
+    ( umask 077
+      printf '%s\t%s\t%s\n' "$(date +%s)" "$1" "$2" >>"$BK_HIST"
+      # keep only the latest 1000 entries so the file does not grow forever
+      if (( $(wc -l <"$BK_HIST") > 2000 )); then
+          tail -n 1000 "$BK_HIST" >"$BK_HIST.tmp" && mv -f "$BK_HIST.tmp" "$BK_HIST"
+      fi ) 2>/dev/null
+}
+
+bk_hist_text() {
+    local ts src dest state total
+    total="$(wc -l <"$BK_HIST" 2>/dev/null)"
+    echo "$(L '최근 백업부터 보여 줍니다.' 'Newest first.')  ($(L '전체' 'total') ${total:-0}$(L '건, 최근 200건 표시' ', showing latest 200'))"
+    echo
+    while IFS=$'\t' read -r ts src dest; do
+        [[ -n "$dest" ]] || continue
+        if [[ -d "$dest" ]]; then state="$(L '있음 · 폴더' 'exists · folder')"
+        elif [[ -e "$dest" ]]; then bk_hsize "$(stat -c %s -- "$dest" 2>/dev/null || echo 0)"; state="$(L '있음' 'exists') · $REPLY"
+        else state="$(L '지워짐' 'removed')"; fi
+        printf '%s  [%s]\n   %s\n → %s\n\n' "$(date -d "@$ts" '+%Y-%m-%d %H:%M' 2>/dev/null)" "$state" "$src" "$dest"
+    done < <(tac "$BK_HIST" 2>/dev/null | head -n 200)
+}
+
+bk_hist() {
+    if [[ ! -s "$BK_HIST" ]]; then
+        msg "$(L '파일·폴더 백업 이력' 'File backup history')" \
+            "$(L '아직 백업 이력이 없습니다.\n파일·폴더 백업을 하면 여기에 기록됩니다.' 'No backup history yet.\nFile/folder backups are recorded here.')" 9
+        return
+    fi
+    show_text "$(L '파일·폴더 백업 이력' 'File backup history')" bk_hist_text
+}
+
+# --- DB backup ----------------------------------------------------------------
+# Find the dump program under the configured path and print its path. Returns 1 if there is none.
+bk_dump_bin() {
+    local b
+    for b in "$BK_DB_HOME/bin/mariadb-dump" "$BK_DB_HOME/bin/mysqldump"; do
+        [[ -x "$b" ]] && { printf '%s' "$b"; return 0; }
+    done
+    return 1
+}
+
+# Pass user / password through a root-only temporary file instead of the command line (visible in ps)
+bk_write_cnf() {
+    local u="$BK_DB_USER" p="$BK_DB_PASS"
+    BK_CNF="$TMP_DIR/db.cnf"
+    u="${u//\\/\\\\}"; u="${u//\"/\\\"}"
+    p="${p//\\/\\\\}"; p="${p//\"/\\\"}"
+    ( umask 077
+      { echo "[client]"; printf 'user="%s"\n' "$u"
+        [[ -n "$BK_DB_PASS" ]] && printf 'password="%s"\n' "$p"; } >"$BK_CNF" )
+}
+
+# DB backup files past the retention period (only files named the way this tool names them)
+bk_db_old() {
+    (( BK_DB_KEEP_DAYS > 0 )) || return 0
+    [[ -d "$BK_DB_DIR" ]] || return 0
+    find "$BK_DB_DIR" -maxdepth 1 -type f \
+        \( -name '*_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9].sql.gz' \
+        -o -name '*_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9].sql' \) \
+        -mmin "+$(( BK_DB_KEEP_DAYS * 1440 ))" -print0 2>/dev/null
+}
+
+# $1=name used in the file name, the rest = dump target arguments. On success BK_LAST_FILE holds the path.
+#  --single-transaction : read a consistent snapshot without locking tables (InnoDB)
+#  --quick              : stream rows instead of buffering the result in memory
+#  nice / ionice        : lower CPU / disk priority to reduce the load on the service
+bk_db_dump_one() {
+    local label="$1" out part ext="sql.gz"; shift
+    [[ "$BK_DB_COMPRESS" == no ]] && ext="sql"
+    out="$BK_DB_DIR/${label}_$(date +%Y%m%d_%H%M%S).$ext"
+    part="$out.part"
+    if [[ "$ext" == sql.gz ]]; then
+        if ! ( umask 077; set -o pipefail
+               nice -n 19 ionice -c 3 "$BK_DUMP" --defaults-extra-file="$BK_CNF" \
+                   --single-transaction --quick --routines --triggers --events --hex-blob "$@" 2>>"$TMP_DIR/dump.err" \
+                 | nice -n 19 gzip -c >"$part" ); then
+            rm -f -- "$part"; return 1
+        fi
+    else
+        if ! ( umask 077
+               nice -n 19 ionice -c 3 "$BK_DUMP" --defaults-extra-file="$BK_CNF" \
+                   --single-transaction --quick --routines --triggers --events --hex-blob "$@" \
+                   2>>"$TMP_DIR/dump.err" >"$part" ); then
+            rm -f -- "$part"; return 1
+        fi
+    fi
+    # check that the dump was written to the end (completion marker on the last line)
+    if ! { if [[ "$ext" == sql.gz ]]; then nice -n 19 gzip -dc -- "$part" 2>/dev/null | tail -n 5; else tail -n 5 -- "$part"; fi; } \
+            | grep -q 'Dump completed'; then
+        echo "$(L '덤프 파일이 끝까지 만들어지지 않았습니다.' 'The dump file is incomplete.')" >>"$TMP_DIR/dump.err"
+        rm -f -- "$part"; return 1
+    fi
+    mv -f -- "$part" "$out" || return 1
+    BK_LAST_FILE="$out"
+    logger -t secpanel-backup "db backup: $label -> $out" 2>/dev/null
+}
+
+# Run the DB backup without any screen (shared by the menu and the schedule). BK_DUMP must be set.
+# Result: BK_DB_MADE (files created), BK_DB_REMOVED (number removed), BK_DB_SECS. The failure reason is in $TMP_DIR/dump.err
+bk_db_run() {
+    local db f ok=1 t0=$SECONDS
+    local -a old=()
+    BK_DB_MADE=(); BK_DB_REMOVED=0
+    : >"$TMP_DIR/dump.err"
+    while IFS= read -r -d '' f; do old+=("$f"); done < <(bk_db_old)
+    bk_dir_safe "$BK_DB_DIR" >>"$TMP_DIR/dump.err" || return 1
+    if ! ( umask 077; mkdir -p -- "$BK_DB_DIR" ) 2>>"$TMP_DIR/dump.err"; then return 1; fi
+    bk_dir_safe "$BK_DB_DIR" >>"$TMP_DIR/dump.err" || return 1
+    bk_write_cnf
+    if [[ -z "$BK_DB_NAME" ]]; then
+        if bk_db_dump_one "all-databases" --all-databases; then BK_DB_MADE+=("$BK_LAST_FILE"); else ok=0; fi
+    else
+        for db in $BK_DB_NAME; do
+            if bk_db_dump_one "$db" "$db"; then BK_DB_MADE+=("$BK_LAST_FILE"); else ok=0; break; fi
+        done
+    fi
+    rm -f -- "$BK_CNF"
+    BK_DB_SECS=$(( SECONDS - t0 ))
+    (( ok )) || return 1
+    # remove old backups only after the new backup succeeded
+    for f in "${old[@]}"; do rm -f -- "$f" && (( BK_DB_REMOVED++ )); done
+    (( BK_DB_REMOVED > 0 )) && logger -t secpanel-backup "db backup: removed $BK_DB_REMOVED file(s) older than ${BK_DB_KEEP_DAYS}d in $BK_DB_DIR" 2>/dev/null
+    return 0
+}
+
+# Entry point for the schedule (systemd timer) and the command line:  secpanel --db-backup
+bk_db_cli() {
+    local f
+    bk_load
+    if ! BK_DUMP="$(bk_dump_bin)"; then
+        echo "secpanel: $(L 'MariaDB 덤프 프로그램을 찾지 못했습니다' 'MariaDB dump program not found'): $BK_DB_HOME/bin/mariadb-dump" >&2
+        return 1
+    fi
+    if bk_db_run; then
+        for f in "${BK_DB_MADE[@]}"; do echo "$(L 'DB 백업 완료' 'DB backup done'): $f ($(du -h -- "$f" 2>/dev/null | cut -f1))"; done
+        (( BK_DB_KEEP_DAYS > 0 )) && echo "$(L '보관 기간이 지나 지운 백업' 'Expired backups removed'): $BK_DB_REMOVED"
+        return 0
+    fi
+    echo "secpanel: $(L 'DB 백업 실패 (기존 백업은 지우지 않음)' 'DB backup failed (existing backups kept)')" >&2
+    tail -n 8 "$TMP_DIR/dump.err" >&2
+    return 1
+}
+
+bk_db() {
+    local f n_old=0 free d
+    bk_load
+    if ! BK_DUMP="$(bk_dump_bin)"; then
+        msg "$(L '[주의] MariaDB 가 설치되어 있지 않습니다' '[CAUTION] MariaDB is not installed')" \
+"$(L '설정된 경로에서 MariaDB 덤프 프로그램을 찾지 못했습니다.' 'No MariaDB dump program was found under the configured path.')\n\n  $BK_DB_HOME/bin/mariadb-dump\n\n$(L 'MariaDB 가 다른 경로에 설치되어 있다면\n백업 → 백업 설정 → DB 설치 경로 를 고쳐 주세요.' \
+     'If MariaDB is installed elsewhere, fix it in\nBackup -> Backup settings -> DB install path.')" 14
+        return
+    fi
+    while IFS= read -r -d '' f; do (( n_old++ )); done < <(bk_db_old)
+    d="$BK_DB_DIR"; while [[ ! -d "$d" ]]; do d="$(dirname "$d")"; done
+    free="$(df -h --output=avail -- "$d" 2>/dev/null | tail -n 1 | tr -d ' ')"
+    yesno "$(L 'DB 백업 확인' 'Confirm DB backup')" \
+"$(L 'MariaDB 를 덤프합니다. 서비스는 멈추지 않습니다.' 'Dump MariaDB. The service keeps running.')\n\n$(L '대상 DB   :' 'Database  :') $(bk_dbname_label)\n$(L 'DB 계정   :' 'DB user   :') $BK_DB_USER\n$(L '저장 위치 :' 'Folder    :') $BK_DB_DIR  ($(L '남은 공간' 'free') ${free:-?})\n$(L '압축      :' 'Compress  :') $( [[ "$BK_DB_COMPRESS" == yes ]] && L '켜짐 (.sql.gz)' 'on (.sql.gz)' || L '꺼짐 (.sql)' 'off (.sql)')\n$(L '보관 기간 :' 'Retention :') $( (( BK_DB_KEEP_DAYS > 0 )) && echo "${BK_DB_KEEP_DAYS}$(L '일' ' days') — $(L '기간이 지난 백업' 'expired backups') ${n_old}$(L '개는 백업 성공 후 삭제' ' removed after success')" || L '지우지 않음' 'keep forever')\n\n$(L '테이블을 잠그지 않는 방식(--single-transaction)으로, 우선순위를 낮춰 실행합니다.\n진행할까요?' 'Runs without locking tables (--single-transaction) at low priority.\nProceed?')" 17 || return
+
+    dialog --backtitle "$BACKTITLE" --title "$(L 'DB 백업 중' 'Backing up DB')" \
+        --infobox "$(L 'DB 를 덤프하고 있습니다. DB 크기에 따라 시간이 걸릴 수 있습니다.\n끝날 때까지 기다려 주세요.' 'Dumping the database. This may take a while.\nPlease wait.')" 7 "$DLG_W"
+    if ! bk_db_run; then
+        msg "$(L 'DB 백업 — 실패' 'DB backup — Failed')" \
+"$(L 'DB 덤프에 실패했습니다. 기존 백업 파일은 지우지 않았습니다.' 'The dump failed. No existing backups were removed.')\n\n$(tail -n 8 "$TMP_DIR/dump.err")\n\n$(L '계정·비밀번호·DB 이름은 백업 → 백업 설정 에서 확인하세요.' 'Check user, password and database name in Backup -> Backup settings.')" 18
+        return 1
+    fi
+    {
+        echo "$(L 'DB 백업이 끝났습니다.' 'DB backup finished.')  ($(L '걸린 시간' 'elapsed') ${BK_DB_SECS}$(L '초' 's'))"
+        echo
+        for f in "${BK_DB_MADE[@]}"; do
+            echo "  $f  ($(du -h -- "$f" 2>/dev/null | cut -f1))"
+        done
+        echo
+        if (( BK_DB_KEEP_DAYS > 0 )); then
+            echo "$(L '보관 기간' 'Retention') ${BK_DB_KEEP_DAYS}$(L '일이 지난 백업' ' days — expired backups removed'): ${BK_DB_REMOVED}$(L '개 삭제' '')"
+        fi
+        echo
+        echo "$(L '복구할 때' 'To restore'):"
+        if [[ "$BK_DB_COMPRESS" == yes ]]; then
+            echo "  gunzip -c <$(L '파일' 'file')> | $BK_DB_HOME/bin/mariadb -u $BK_DB_USER -p <DB>"
+        else
+            echo "  $BK_DB_HOME/bin/mariadb -u $BK_DB_USER -p <DB> < <$(L '파일' 'file')>"
+        fi
+    } >"$TMP_OUT"
+    msg "$(L 'DB 백업 — 성공' 'DB backup — OK')" "$(cat "$TMP_OUT")" 16
+}
+
+# --- scheduled DB backup (systemd timer) ---------------------------------------
+# secpanel does not need to keep running. At the set time systemd runs 'secpanel --db-backup'
+# once and it exits. A run missed while the server was off happens once after boot (Persistent).
+bk_dow_label() {
+    case "$1" in
+        Mon) L '월요일' 'Monday' ;;   Tue) L '화요일' 'Tuesday' ;; Wed) L '수요일' 'Wednesday' ;;
+        Thu) L '목요일' 'Thursday' ;; Fri) L '금요일' 'Friday' ;;  Sat) L '토요일' 'Saturday' ;;
+        Sun) L '일요일' 'Sunday' ;;
+    esac
+}
+bk_sched_label() {
+    case "$BK_SCHED" in
+        daily)   echo "$(L '매일' 'Every day') $BK_SCHED_TIME" ;;
+        weekly)  echo "$(L '매주' 'Every') $(bk_dow_label "$BK_SCHED_DOW") $BK_SCHED_TIME" ;;
+        monthly) if [[ "$BK_SCHED_DOM" == last ]]; then echo "$(L '매월 말일' 'Monthly, last day') $BK_SCHED_TIME"
+                 else echo "$(L '매월' 'Monthly, day') ${BK_SCHED_DOM}$(L '일' '') $BK_SCHED_TIME"; fi ;;
+        *)       L '꺼짐' 'off' ;;
+    esac
+}
+bk_sched_calendar() {
+    case "$BK_SCHED" in
+        daily)   echo "*-*-* ${BK_SCHED_TIME}:00" ;;
+        weekly)  echo "${BK_SCHED_DOW} *-*-* ${BK_SCHED_TIME}:00" ;;
+        # *-*~01 = last day of the month (systemd works out 28/29/30/31)
+        monthly) if [[ "$BK_SCHED_DOM" == last ]]; then echo "*-*~01 ${BK_SCHED_TIME}:00"
+                 else printf '*-*-%02d %s:00\n' "$((10#$BK_SCHED_DOM))" "$BK_SCHED_TIME"; fi ;;
+    esac
+}
+# Apply the current BK_SCHED* settings to systemd (remove the units when off)
+bk_sched_apply() {
+    local dir="/etc/systemd/system" cal self
+    cal="$(bk_sched_calendar)"
+    if [[ -z "$cal" ]]; then
+        systemctl disable --now "$BK_UNIT.timer" >/dev/null 2>&1
+        rm -f "$dir/$BK_UNIT.timer" "$dir/$BK_UNIT.service"
+        systemctl daemon-reload >/dev/null 2>&1
+        return 0
+    fi
+    self="$(readlink -f "$0" 2>/dev/null)"; [[ -x "$self" ]] || self="/usr/bin/secpanel"
+    cat >"$dir/$BK_UNIT.service" <<EOF
+[Unit]
+Description=secpanel scheduled MariaDB backup (secpanel --db-backup)
+
+[Service]
+Type=oneshot
+ExecStart=$self --db-backup
+Nice=19
+IOSchedulingClass=idle
+EOF
+    cat >"$dir/$BK_UNIT.timer" <<EOF
+[Unit]
+Description=secpanel scheduled MariaDB backup timer
+
+[Timer]
+OnCalendar=$cal
+Persistent=true
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+EOF
+    chmod 644 "$dir/$BK_UNIT.service" "$dir/$BK_UNIT.timer"
+    restorecon "$dir/$BK_UNIT.service" "$dir/$BK_UNIT.timer" >/dev/null 2>&1
+    systemctl daemon-reload >/dev/null 2>&1
+    systemctl enable "$BK_UNIT.timer" >/dev/null 2>&1
+    systemctl restart "$BK_UNIT.timer" 2>"$TMP_OUT"
+}
+bk_sched_next() {
+    local v
+    systemctl is-active --quiet "$BK_UNIT.timer" 2>/dev/null || { L '(예약 없음)' '(not scheduled)'; return; }
+    v="$(systemctl show "$BK_UNIT.timer" -p NextElapseUSecRealtime --value 2>/dev/null)"
+    [[ -n "$v" && "$v" != "n/a" ]] && date -d "$v" '+%Y-%m-%d %H:%M (%a)' 2>/dev/null || echo "${v:-?}"
+}
+bk_sched_last() {
+    local ts res
+    ts="$(systemctl show "$BK_UNIT.service" -p ExecMainExitTimestamp --value 2>/dev/null)"
+    res="$(systemctl show "$BK_UNIT.service" -p Result --value 2>/dev/null)"
+    if [[ -z "$ts" || "$ts" == "n/a" ]]; then L '(아직 실행된 적 없음)' '(never run)'; return; fi
+    if [[ "$res" == success ]]; then echo "$(L '성공' 'OK') — $(date -d "$ts" '+%Y-%m-%d %H:%M' 2>/dev/null)"
+    else echo "$(L '실패' 'FAILED') ($res) — $(date -d "$ts" '+%Y-%m-%d %H:%M' 2>/dev/null)"; fi
+}
+bk_sched_log_text() {
+    echo "$(L '자동 백업 실행 기록 (최근 것이 위)' 'Scheduled backup log (newest first)')"
+    echo
+    journalctl -u "$BK_UNIT.service" -n 40 -r --no-pager -o short-iso 2>&1 | sed 's/^\([0-9-]*\)T\([0-9:]*\)[^ ]* [^ ]* /\1 \2 /'
+}
+
+bk_sched() {
+    local choice v
+    bk_load
+    while true; do
+        choice="$(dlg --title "$(L 'DB 자동 백업 예약' 'Scheduled DB backup')" --cancel-label "$(L '뒤로' 'Back')" \
+            --menu "$(L '정해 둔 시각에 DB 백업을 자동으로 실행합니다. (secpanel 을 켜 둘 필요 없음)' 'Runs the DB backup automatically at the set time. (secpanel need not stay open)')\n\n$(L '현재 예약   :' 'Schedule :') $(bk_sched_label)\n$(L '다음 실행   :' 'Next run :') $(bk_sched_next)\n$(L '마지막 실행 :' 'Last run :') $(bk_sched_last)" \
+            "$DLG_H" "$DLG_W" 6 \
+            1 "$(L '매일' 'Every day')" \
+            2 "$(L '매주 (요일 선택)' 'Every week (pick a weekday)')" \
+            3 "$(L '매월 (날짜 또는 말일)' 'Every month (a day or the last day)')" \
+            4 "$(L '예약 끄기' 'Turn schedule off')" \
+            5 "$(L '실행 기록 보기' 'View run log')")" || return
+        case "$choice" in
+            5) show_text "$(L '자동 백업 실행 기록' 'Scheduled backup log')" bk_sched_log_text; continue ;;
+            4) if [[ "$BK_SCHED" == off ]] && ! systemctl is-enabled --quiet "$BK_UNIT.timer" 2>/dev/null; then
+                   msg "$(L 'DB 자동 백업 예약' 'Scheduled DB backup')" "$(L '예약이 이미 꺼져 있습니다.' 'The schedule is already off.')" 7; continue
+               fi
+               BK_SCHED="off"; bk_save; bk_sched_apply
+               msg "$(L '예약 끄기 — 성공' 'Schedule off — OK')" "$(L 'DB 자동 백업 예약을 껐습니다. 이미 받아 둔 백업 파일은 그대로 있습니다.' 'Scheduled DB backup is off. Existing backup files are kept.')" 8
+               continue ;;
+            2) v="$(dlg --title "$(L '요일 선택' 'Pick a weekday')" --default-item "$BK_SCHED_DOW" \
+                    --menu "$(L '매주 무슨 요일에 백업할까요?' 'Which weekday?')" 15 "$DLG_W" 7 \
+                    Mon "$(bk_dow_label Mon)" Tue "$(bk_dow_label Tue)" Wed "$(bk_dow_label Wed)" Thu "$(bk_dow_label Thu)" \
+                    Fri "$(bk_dow_label Fri)" Sat "$(bk_dow_label Sat)" Sun "$(bk_dow_label Sun)")" || continue
+               BK_SCHED_DOW="$v" ;;
+            3) v="$(dlg --title "$(L '날짜 선택' 'Pick a day')" --default-item "$( [[ "$BK_SCHED_DOM" == last ]] && echo last || echo day )" \
+                    --menu "$(L '매월 언제 백업할까요?' 'When in the month?')" 11 "$DLG_W" 2 \
+                    day  "$(L '날짜를 지정 (1~28일)' 'A specific day (1-28)')" \
+                    last "$(L '매월 말일 (28·29·30·31일 중 그 달의 마지막 날)' 'Last day of each month')")" || continue
+               if [[ "$v" == last ]]; then BK_SCHED_DOM="last"
+               else
+                   v="$(dlg_input "$(L '날짜 선택' 'Pick a day')" \
+                        "$(L '매월 며칠에 백업할까요? (1~28)\n29~31일은 없는 달이 있어 받지 않습니다. 월말에 받으려면 "매월 말일"을 고르세요.' 'Which day of the month? (1-28)\nDays 29-31 do not exist in every month; use "Last day" instead.')" \
+                        "$( [[ "$BK_SCHED_DOM" == last ]] && echo 1 || echo "$BK_SCHED_DOM" )")" || continue
+                   if [[ "$v" =~ ^([1-9]|1[0-9]|2[0-8])$ ]]; then BK_SCHED_DOM="$v"
+                   else msg "$(L '입력 오류' 'Invalid input')" "$(L '1~28 사이 숫자를 입력하세요.' 'Enter a number between 1 and 28.')" 8; continue; fi
+               fi ;;
+        esac
+        v="$(dlg_input "$(L '실행 시각' 'Time of day')" \
+            "$(L '몇 시 몇 분에 백업할까요? 24시간 형식 HH:MM 으로 입력하세요.\n예) 03:00  (이용자가 적은 새벽 시간을 권장)' 'What time? Use 24-hour HH:MM.\ne.g. 03:00  (a quiet hour is recommended)')" "$BK_SCHED_TIME")" || continue
+        if [[ ! "$v" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+            msg "$(L '입력 오류' 'Invalid input')" "$(L '시각은 HH:MM 형식(00:00~23:59)으로 입력하세요.' 'Enter the time as HH:MM (00:00-23:59).')" 8; continue
+        fi
+        BK_SCHED_TIME="$v"
+        case "$choice" in 1) BK_SCHED="daily" ;; 2) BK_SCHED="weekly" ;; 3) BK_SCHED="monthly" ;; esac
+        bk_save
+        if bk_sched_apply && systemctl is-active --quiet "$BK_UNIT.timer"; then
+            BK_DUMP="$(bk_dump_bin)" || v="\n\n$(L '[주의] 지금 설정된 경로에서 MariaDB 를 찾지 못했습니다. 백업 설정을 확인하세요.' '[CAUTION] MariaDB was not found under the configured path. Check Backup settings.')"
+            [[ -n "${BK_DUMP:-}" ]] && v=""
+            msg "$(L '예약 — 성공' 'Schedule — OK')" \
+"$(L 'DB 자동 백업을 예약했습니다.' 'Scheduled DB backup is set.')\n\n$(L '예약      :' 'Schedule :') $(bk_sched_label)\n$(L '다음 실행 :' 'Next run :') $(bk_sched_next)\n$(L '저장 위치 :' 'Folder   :') $BK_DB_DIR\n\n$(L '서버가 꺼져 있어 시각을 놓치면, 켜진 뒤 한 번 실행합니다.\n백업 대상·계정·보관 기간은 백업 설정의 값을 그대로 씁니다.' 'If the server is off at that time, the backup runs once after boot.\nDatabase, user and retention come from Backup settings.')${v}" 17
+        else
+            msg "$(L '예약 — 실패' 'Schedule — Failed')" "$(L '타이머를 등록하지 못했습니다.' 'Could not register the timer.')\n\n$(cat "$TMP_OUT")" 12
+        fi
+    done
+}
+
+bk_db_list_text() {
+    local f
+    echo "$(L '위치' 'Folder'): $BK_DB_DIR"
+    echo
+    ( cd "$BK_DB_DIR" 2>/dev/null && ls -1t -- *.sql.gz *.sql 2>/dev/null ) | while IFS= read -r f; do
+        printf '%s  %6s  %s\n' "$(date -r "$BK_DB_DIR/$f" '+%Y-%m-%d %H:%M')" "$(du -h -- "$BK_DB_DIR/$f" | cut -f1)" "$f"
+    done
+    echo
+    echo "$(L '남은 공간' 'Free space'): $(df -h --output=avail -- "$BK_DB_DIR" | tail -n 1 | tr -d ' ')"
+    if (( BK_DB_KEEP_DAYS > 0 )); then
+        echo "$(L '보관 기간' 'Retention'): ${BK_DB_KEEP_DAYS}$(L '일 (다음 DB 백업이 성공하면 지난 파일 삭제)' ' days (expired files are removed after the next successful DB backup)')"
+    fi
+    echo "$(L '자동 백업' 'Schedule'): $(bk_sched_label)"
+}
+
+bk_db_list() {
+    bk_load
+    if [[ ! -d "$BK_DB_DIR" ]] || ! compgen -G "$BK_DB_DIR/*.sql*" >/dev/null; then
+        msg "$(L 'DB 백업 목록' 'DB backups')" "$(L '아직 DB 백업이 없습니다.' 'No DB backups yet.')\n\n  $BK_DB_DIR" 9; return
+    fi
+    show_text "$(L 'DB 백업 목록' 'DB backups')" bk_db_list_text
+}
+
+backup_menu() {
+    local choice
+    bk_load
+    while true; do
+        choice="$(dlg --title "$(L '백업' 'Backup')" --cancel-label "$(L '뒤로' 'Back')" \
+            --menu "$(L '설정 파일을 고치기 전이나 작업 전에 백업을 받아 두세요.' 'Take a backup before editing config files or starting work.')" \
+            "$DLG_H" "$DLG_W" "$MENU_H" \
+            1 "$(L '파일·폴더 백업 (골라서 복사)' 'Back up files/folders')" \
+            2 "$(L '파일·폴더 백업 이력 보기' 'File backup history')" \
+            3 "$(L 'DB 백업 (MariaDB 덤프)' 'Back up database (MariaDB dump)')" \
+            4 "$(L 'DB 백업 목록 보기' 'List DB backups')" \
+            5 "$(L 'DB 자동 백업 예약' 'Scheduled DB backup') [$(bk_sched_label)]" \
+            6 "$(L '백업 설정' 'Backup settings')")" || return
+        case "$choice" in
+            1) bk_files ;;
+            2) bk_hist ;;
+            3) bk_db ;;
+            4) bk_db_list ;;
+            5) bk_sched ;;
+            6) bk_settings ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
+# About / Help / Commands
+# ---------------------------------------------------------------------------
+# Show pre-formatted text as is (no automatic wrapping) in a scrolling window
+show_page() {
+    local title="$1"; shift
+    "$@" >"$TMP_OUT" 2>&1
+    flush_input
+    dialog --backtitle "$BACKTITLE" --exit-label "$(L '닫기' 'Close')" --title "$title" \
+        --textbox "$TMP_OUT" "$DLG_H" "$DLG_W"
+}
+
+info_about_text() {
+    if [[ "$LANG_MODE" == "en" ]]; then cat <<EOF
+secpanel ${APP_VERSION}
+
+A menu tool for server work: firewall, SELinux, lockout guard and
+backup in one place. You only pick from menus - no commands to remember.
+
+[ 1 Firewall ]
+  - View open ports / services / allowed IPs, whole policy at a glance
+  - Open or close a port, add or remove a service (http, https ...)
+  - Allow a port from one IP only (e.g. 3306 from the web server only)
+  - Every change is saved permanently and applied at once
+
+[ 2 SELinux ]
+  - Status, switch Enforcing <-> Permissive
+  - Port policy, Boolean switches, file contexts
+  - Build an allow policy from denial logs (pick the program first)
+  - Remove policy modules you installed
+
+[ 3 Lockout guard ]
+  - Snapshot firewall / sshd / network before a risky change
+  - If you do not confirm in time, it reverts automatically -
+    even if your SSH session is gone
+  - Remaining time is shown at the top right; history is kept
+
+[ 4 Backup ]
+  - Files / folders: pick in a browser, owner / mode / time / SELinux
+    label are preserved; many items can be bundled into one tar
+  - MariaDB: dump without stopping the service, optional gzip,
+    old dumps removed after the retention period
+  - Scheduled DB backup: daily / weekly / monthly (or last day)
+
+Supported OS : RHEL / Rocky Linux / AlmaLinux 9
+Run as       : root  (sudo secpanel)
+Languages    : Korean / English (main menu 5)
+Settings     : /etc/secpanel/
+Version      : secpanel --version   or   rpm -q secpanel
+EOF
+    else cat <<EOF
+secpanel ${APP_VERSION}
+
+방화벽·SELinux·작업 안전장치·백업을 한곳에서 다루는 서버 도구입니다.
+명령어를 외울 필요 없이 메뉴에서 고르기만 하면 됩니다.
+
+[ 1 방화벽 관리 ]
+  - 열린 포트·서비스·허용 IP 보기, 전체 정책 한눈에 보기
+  - 포트 열기/닫기, 서비스(http, https 등) 추가/삭제
+  - 특정 IP에서만 포트 허용 (예: 웹서버에서만 3306 접속)
+  - 바꾼 내용은 모두 영구 저장되고 바로 적용됩니다
+
+[ 2 SELinux 관리 ]
+  - 상태 보기, Enforcing <-> Permissive 모드 전환
+  - 포트 정책, Boolean 스위치, 파일 컨텍스트 관리
+  - 거부 로그로 허용 정책 만들기 (허용할 프로그램을 먼저 선택)
+  - 직접 설치한 정책 모듈 삭제
+
+[ 3 작업 안전장치 ]
+  - 방화벽·sshd·네트워크를 바꾸기 전에 지금 상태를 저장
+  - 정한 시간 안에 '확정'하지 않으면 자동으로 원래대로 되돌림
+    (내 SSH 접속이 끊겨도 되돌리기는 실행됩니다)
+  - 남은 시간은 화면 맨 위 오른쪽에 표시, 켬·확정·원복 기록 보관
+
+[ 4 백업 ]
+  - 파일·폴더: 탐색기에서 골라 복사. 소유자·권한·수정시각·SELinux
+    라벨을 그대로 보존. 여러 개는 tar 하나로 묶을 수 있음
+  - MariaDB: 서비스를 멈추지 않고 덤프, gzip 압축 선택,
+    보관 기간이 지난 백업은 자동 삭제
+  - DB 자동 백업 예약: 매일 / 매주 / 매월(날짜 또는 말일)
+
+지원 OS   : RHEL / Rocky Linux / AlmaLinux 9
+실행 권한 : root  (sudo secpanel)
+언어      : 한국어 / English (메인 메뉴 5번)
+설정 파일 : /etc/secpanel/
+버전 확인 : secpanel --version   또는   rpm -q secpanel
+EOF
+    fi
+}
+
+info_help_text() {
+    if [[ "$LANG_MODE" == "en" ]]; then cat <<EOF
+[ Keys ]
+  Up / Down     move            Enter       select / run
+  Tab           move to buttons Space       check / uncheck in lists
+  Number key    jump to that menu item
+  ESC, Ctrl+C   go back one level. On the main menu ESC only moves the
+                cursor to <Quit>; the program ends with <Quit> + Enter.
+  Ctrl+L        redraw the screen if it looks broken
+  In text boxes use Up / Down to move between the field and buttons.
+
+[ Before you change things remotely ]
+  - Arm the lockout guard first (main menu 3) when touching the
+    firewall, sshd or network. If you lock yourself out, it reverts.
+  - After the change, check that a NEW connection works, then choose
+    "Confirm (ok)". If you forget, the change is rolled back.
+  - The time left is shown at the top right of the screen.
+
+[ Firewall tips ]
+  - Open DB or admin ports with "Allow a port from one IP only",
+    not for everyone.
+  - Port is open but still no connection? Check: is the service
+    running, does SELinux allow the port (SELinux > port policy),
+    is there another firewall in front (cloud, network device).
+
+[ SELinux tips ]
+  - A service fails to start: switch to Permissive for a moment.
+    If it works then, SELinux is the cause - fix the policy and
+    switch back to Enforcing. Do not leave it Permissive.
+  - Non-standard port -> port policy. Non-standard folder -> file
+    context. Feature switch -> Boolean.
+
+[ Backup tips ]
+  - Back up a config file before editing it (Backup > files/folders).
+    The copy is named like server.xml_20261001.
+  - Schedule the DB backup at a quiet hour and set a retention
+    period so the disk does not fill up.
+  - A backup on the same disk does not survive a disk failure.
+    Copy important backups to another server as well.
+
+[ Where things are recorded ]
+  Guard history     /var/log/secpanel-guard.log
+  File backups      /var/log/secpanel-backup.log
+  Backup journal    journalctl -t secpanel-backup
+  Scheduled backup  journalctl -u secpanel-dbbackup
+
+[ Other ]
+  - Korean looks broken on a console? Main menu 5 > English.
+  - Step-by-step manuals with screenshots come as separate documents.
+EOF
+    else cat <<EOF
+[ 키 조작 ]
+  위/아래 방향키  이동            Enter   선택·실행
+  Tab             버튼으로 이동   Space   목록에서 체크/해제
+  숫자 키         그 번호의 메뉴로 바로 이동
+  ESC, Ctrl+C     한 단계 뒤로. 메인 메뉴에서는 ESC 를 눌러도 꺼지지
+                  않고 커서만 <종료> 로 갑니다. <종료> 에서 Enter 를
+                  눌러야 끝납니다.
+  Ctrl+L          화면이 깨져 보일 때 다시 그리기
+  입력창에서는 위/아래 방향키로 입력칸과 버튼 사이를 오갑니다.
+
+[ 원격에서 설정을 바꾸기 전에 ]
+  - 방화벽·sshd·네트워크를 만질 때는 작업 안전장치(메인 메뉴 3번)를
+    먼저 켜세요. 접속이 막혀도 정한 시간 뒤 자동으로 되돌아옵니다.
+  - 바꾼 뒤에는 '새로 접속'이 되는지 확인하고 "확정(ok)"을 누르세요.
+    확정을 잊으면 바꾼 내용이 원래대로 되돌려집니다.
+  - 남은 시간은 화면 맨 위 오른쪽에 표시됩니다.
+
+[ 방화벽 팁 ]
+  - DB·관리용 포트는 모두에게 열지 말고 "특정 IP에서만 포트 허용"
+    으로 여세요.
+  - 포트를 열었는데도 접속이 안 되면: 프로그램이 떠 있는지,
+    SELinux 가 그 포트를 허용하는지(SELinux 관리 > 포트 정책),
+    서버 앞에 다른 방화벽(클라우드·네트워크 장비)이 있는지 확인.
+
+[ SELinux 팁 ]
+  - 서비스가 안 뜰 때: 잠깐 Permissive 로 바꿔 보세요. 그때 되면
+    원인은 SELinux 입니다. 정책을 고친 뒤 꼭 Enforcing 으로 되돌리세요.
+  - 다른 포트를 쓴다 -> 포트 정책 / 다른 폴더를 쓴다 -> 파일 컨텍스트
+    기능을 켜고 끈다 -> Boolean 스위치
+
+[ 백업 팁 ]
+  - 설정 파일을 고치기 전에 먼저 백업하세요 (백업 > 파일·폴더 백업).
+    백업본은 server.xml_20261001 같은 이름으로 만들어집니다.
+  - DB 백업은 이용자가 적은 시간에 예약하고, 디스크가 차지 않게
+    보관 기간을 정해 두세요.
+  - 같은 디스크에 둔 백업은 디스크가 고장 나면 함께 사라집니다.
+    중요한 백업은 다른 서버에도 복사해 두세요.
+
+[ 기록이 남는 곳 ]
+  안전장치 기록     /var/log/secpanel-guard.log
+  파일 백업 이력    /var/log/secpanel-backup.log
+  백업 실행 기록    journalctl -t secpanel-backup
+  자동 백업 기록    journalctl -u secpanel-dbbackup
+
+[ 그 밖에 ]
+  - 콘솔에서 한글이 깨지면: 메인 메뉴 5번 > English
+  - 화면 캡처를 따라 하는 단계별 매뉴얼은 별도 문서로 제공됩니다.
+EOF
+    fi
+}
+
+info_cmd_text() {
+    local ko=1; [[ "$LANG_MODE" == "en" ]] && ko=0
+    local db="$BK_DB_HOME/bin"
+    if (( ko )); then cat <<EOF
+메뉴 화면(TUI)을 쓸 수 없을 때 같은 일을 명령으로 하는 방법입니다.
+모두 root 권한이 필요합니다. < > 안은 상황에 맞게 바꿔 넣으세요.
+
+EOF
+    else cat <<EOF
+How to do the same things with commands when the menu (TUI) cannot
+be used. All need root. Replace the < > parts.
+
+EOF
+    fi
+    cat <<EOF
+==================== $( ((ko)) && echo '방화벽' || echo 'Firewall' ) ====================
+# $( ((ko)) && echo '지금 상태 보기' || echo 'Show current state' )
+firewall-cmd --state
+firewall-cmd --get-active-zones
+firewall-cmd --list-all
+
+# $( ((ko)) && echo '포트 열기 / 닫기 (영구 저장 후 적용)' || echo 'Open / close a port (permanent, then apply)' )
+firewall-cmd --permanent --add-port=8080/tcp
+firewall-cmd --permanent --remove-port=8080/tcp
+firewall-cmd --reload
+
+# $( ((ko)) && echo '서비스 이름으로 열기 / 닫기' || echo 'Open / close by service name' )
+firewall-cmd --permanent --add-service=https
+firewall-cmd --permanent --remove-service=https
+firewall-cmd --reload
+
+# $( ((ko)) && echo '특정 IP에서만 포트 허용 (한 줄로 입력)' || echo 'Allow a port from one IP only (one line)' )
+firewall-cmd --permanent --add-rich-rule='rule family="ipv4"
+  source address="192.168.0.10" port port="3306" protocol="tcp" accept'
+firewall-cmd --reload
+# $( ((ko)) && echo '규칙 보기 / 지우기: --list-rich-rules / --remove-rich-rule=...' || echo 'List / remove: --list-rich-rules / --remove-rich-rule=...' )
+
+==================== SELinux ====================
+# $( ((ko)) && echo '상태 보기, 모드 전환 (0 = Permissive, 1 = Enforcing)' || echo 'Status, switch mode (0 = Permissive, 1 = Enforcing)' )
+getenforce
+sestatus
+setenforce 0
+setenforce 1
+
+# $( ((ko)) && echo '포트 정책 보기 / 추가 / 삭제' || echo 'Port policy: list / add / delete' )
+semanage port -l | grep http_port_t
+semanage port -a -t http_port_t -p tcp 8080
+semanage port -d -t http_port_t -p tcp 8080
+
+# $( ((ko)) && echo 'Boolean 스위치 보기 / 바꾸기 (-P = 재부팅 후에도 유지)' || echo 'Booleans: show / set (-P = keep after reboot)' )
+getsebool -a | grep httpd
+setsebool -P httpd_can_network_connect on
+
+# $( ((ko)) && echo '파일 컨텍스트 추가 후 실제 파일에 적용' || echo 'Add a file context, then apply it to the files' )
+semanage fcontext -a -t httpd_sys_content_t '/srv/web(/.*)?'
+restorecon -Rv /srv/web
+
+# $( ((ko)) && echo '거부 로그 보기, 허용 정책 만들어 넣기 / 지우기' || echo 'Denials, build and load an allow policy / remove it' )
+ausearch -m avc -ts recent
+ausearch -m avc -ts recent -c <$( ((ko)) && echo '프로그램' || echo 'program' )> | audit2allow -M <$( ((ko)) && echo '이름' || echo 'name' )>
+semodule -i <$( ((ko)) && echo '이름' || echo 'name' )>.pp
+semodule -r <$( ((ko)) && echo '이름' || echo 'name' )>
+
+==================== $( ((ko)) && echo '작업 안전장치' || echo 'Lockout guard' ) ====================
+# $( ((ko)) && echo '켜기: 300초 안에 확정하지 않으면 방화벽을 자동 원복' || echo 'Arm: revert the firewall unless confirmed within 300s' )
+secpanel-guard arm --timeout 300 --targets firewall --note "<$( ((ko)) && echo '메모' || echo 'note' )>"
+#   --targets : firewall,sshd,network $( ((ko)) && echo '중에서 쉼표로 (기본 all)' || echo '(comma separated, default all)' )
+secpanel-guard status      # $( ((ko)) && echo '상태·남은 시간' || echo 'state, time left' )
+secpanel-guard ok          # $( ((ko)) && echo '확정 (변경 유지)' || echo 'confirm (keep changes)' )
+secpanel-guard rollback    # $( ((ko)) && echo '지금 바로 되돌리기' || echo 'roll back now' )
+secpanel-guard log         # $( ((ko)) && echo '켬·확정·원복 기록' || echo 'history' )
+
+==================== $( ((ko)) && echo '백업' || echo 'Backup' ) ====================
+# $( ((ko)) && echo '파일·폴더를 소유자·권한 그대로 복사' || echo 'Copy a file / folder keeping owner and mode' )
+cp -a /etc/nginx/nginx.conf /etc/nginx/nginx.conf_\$(date +%Y%m%d)
+cp -a /etc/nginx /etc/nginx_\$(date +%Y%m%d)
+
+# $( ((ko)) && echo '여러 개를 tar 하나로 / 내용 보기 / 원래 자리에 풀기' || echo 'Bundle into one tar / list / restore in place' )
+tar -C / --selinux --acls --xattrs -cpf /root/backup.tar \\
+    etc/nginx etc/my.cnf
+tar -tvf /root/backup.tar
+tar -C / --selinux --acls --xattrs -xpf /root/backup.tar
+
+# $( ((ko)) && echo 'DB 덤프 (서비스 중단 없이) / 복구' || echo 'DB dump (service keeps running) / restore' )
+$db/mariadb-dump -u root -p \\
+    --single-transaction --quick --routines --triggers --events \\
+    <DB> | gzip > /root/<DB>_\$(date +%Y%m%d).sql.gz
+gunzip -c <$( ((ko)) && echo '파일' || echo 'file' )>.sql.gz \\
+    | $db/mariadb -u root -p <DB>
+
+# $( ((ko)) && echo 'secpanel 에 저장해 둔 설정대로 DB 백업 1회 실행' || echo 'Run the DB backup once with the saved secpanel settings' )
+secpanel --db-backup
+
+# $( ((ko)) && echo '자동 백업 예약 확인 / 실행 기록' || echo 'Scheduled backup: next run / log' )
+systemctl list-timers secpanel-dbbackup.timer
+journalctl -u secpanel-dbbackup
+
+==================== secpanel ====================
+secpanel --version         # $( ((ko)) && echo '버전' || echo 'version' )
+secpanel --english         # $( ((ko)) && echo '영어 화면으로 실행(저장됨)' || echo 'run in English (saved)' )
+secpanel --korean          # $( ((ko)) && echo '한국어 화면으로 실행(저장됨)' || echo 'run in Korean (saved)' )
+rpm -q --changelog secpanel | less   # $( ((ko)) && echo '버전별 변경 내용' || echo 'changes by version' )
+EOF
+}
+
+info_menu() {
+    local choice
+    while true; do
+        choice="$(dlg --title "$(L '정보 / 도움말' 'About / Help')" --cancel-label "$(L '뒤로' 'Back')" \
+            --menu "$(L '보고 싶은 항목을 선택하세요.' 'Choose what to read.')" 12 "$DLG_W" 3 \
+            1 "$(L '정보   — 기능 소개, 지원 OS' 'About    — features, supported OS')" \
+            2 "$(L '도움말 — 키 조작, 작업 팁' 'Help     — keys and tips')" \
+            3 "$(L '명령어 — 메뉴 없이 명령으로 하는 방법' 'Commands — doing the same without the menu')")" || return
+        case "$choice" in
+            1) show_page "$(L '정보' 'About')" info_about_text ;;
+            2) show_page "$(L '도움말' 'Help')" info_help_text ;;
+            3) bk_load; show_page "$(L '명령어' 'Commands')" info_cmd_text ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Language selection
+# ---------------------------------------------------------------------------
+lang_menu() {
+    local choice
+    choice="$(dlg --title "$(L '언어 / Language' 'Language / 언어')" --cancel-label "$(L '뒤로' 'Back')" \
+        --menu "$(L '언어를 선택하세요.' 'Select a language.')" 11 "$DLG_W" 2 \
+        ko "$(L '한국어' 'Korean (한국어)')" \
+        en "$(L 'English (영어)' 'English')")" || return
+    case "$choice" in
+        ko) LANG_MODE="ko"; save_lang ;;
+        en) LANG_MODE="en"; save_lang ;;
+    esac
+    BACKTITLE="secpanel ${APP_VERSION} — $(L '방화벽·SELinux·작업 안전장치·백업' 'Firewall·SELinux·Guard·Backup')"
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+main_menu() {
+    local rc fails=0 defbtn=ok
+    while true; do
+        local choice
+        GOT_INT=0
+        choice="$(dlg --title "$(L '메인 메뉴' 'Main menu')" --cancel-label "$(L '종료' 'Quit')" --default-button "$defbtn" \
+            --menu "$(L '무엇을 관리할까요?' 'What would you like to manage?')" 17 "$DLG_W" 6 \
+            1 "$(L '방화벽 관리' 'Firewall')" \
+            2 "$(L 'SELinux 관리' 'SELinux')" \
+            3 "$(L '작업 안전장치' 'Lockout guard')" \
+            4 "$(L '백업' 'Backup')" \
+            5 "$(L '언어 변경 / Language' 'Language / 언어')" \
+            6 "$(L '정보 / 도움말' 'About / Help')")"
+        rc=$?
+        # Only the <Quit> button (1) ends the program. ESC / Ctrl+C do not quit; they just move the cursor to <Quit>
+        # (so that after pressing ESC back to the main menu, Enter leads to quitting).
+        if (( rc == 1 )) && (( ! GOT_INT )); then
+            # If the cursor was put on <Quit> by ESC, ask once more. In that state, choosing an item with the
+            # arrow keys and pressing Enter activates <Quit>, not the item (prevents quitting by accident)
+            if [[ "$defbtn" == cancel ]]; then
+                yesno "$(L '종료' 'Quit')" "$(L 'secpanel 을 종료할까요?' 'Quit secpanel?')" 7 50 || { defbtn=ok; continue; }
+            fi
+            break
+        fi
+        if (( rc != 0 )); then
+            if (( rc == DIALOG_ESC || GOT_INT )); then GOT_INT=0; fails=0; defbtn=cancel; continue; fi
+            # Any other code means the screen could not be drawn (terminal too small etc.). Do not loop forever; explain and exit
+            if (( ++fails >= 3 )); then
+                EXIT_NOTE="$(L 'secpanel: 화면을 표시할 수 없어 종료했습니다. 터미널 창을 80x24 이상으로 키운 뒤 다시 실행하세요.' \
+                               'secpanel: could not draw the screen and exited. Enlarge the terminal to at least 80x24 and run again.') (stty size: $(stty size 2>/dev/null))"
+                break
+            fi
+            sleep 0.3; continue
+        fi
+        fails=0; GOT_INT=0; defbtn=ok
+        case "$choice" in
+            1) firewall_menu ;;
+            2) selinux_menu ;;
+            3) guard_menu ;;
+            4) backup_menu ;;
+            5) lang_menu ;;
+            6) info_menu ;;
+        esac
+    done
+}
+
+# ---- entrypoint ----
+case "${1:-}" in
+    -v|--version) echo "${APP_NAME} ${APP_VERSION}"; exit 0 ;;
+    --db-backup)  need_root; bk_db_cli; exit $? ;;
+    --apply-schedule)   # re-register the saved schedule in systemd (called by the package scriptlet after a package swap)
+        need_root; bk_load; bk_sched_apply; exit 0 ;;
+    -e|--en|--english) LANG_MODE="en"; save_lang; shift ;;
+    -k|--ko|--korean)  LANG_MODE="ko"; save_lang; shift ;;
+    -h|--help)
+        cat <<EOF
+${APP_NAME} ${APP_VERSION} — Firewall / SELinux management TUI
+
+Usage:
+  sudo ${APP_NAME}            run the menu
+  sudo ${APP_NAME} --english  switch to English (persists)
+  sudo ${APP_NAME} --korean   switch to Korean (persists)
+  ${APP_NAME} --version       show version
+  sudo ${APP_NAME} --db-backup  run the MariaDB backup once, no menu (used by the schedule)
+  ${APP_NAME} --help          this help
+
+Language can also be set via SECPANEL_LANG=en|ko, or the in-app Language menu.
+Target: RHEL / Rocky / AlmaLinux 9. Requires root.
+EOF
+        exit 0 ;;
+esac
+
+BACKTITLE="secpanel ${APP_VERSION} — $(L '방화벽·SELinux·작업 안전장치·백업' 'Firewall·SELinux·Guard·Backup')"
+need_root
+preflight
+guard_ticker </dev/null >/dev/null 2>&1 &
+TICKER_PID=$!
+main_menu

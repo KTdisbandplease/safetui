@@ -1,0 +1,373 @@
+#!/usr/bin/env bash
+#
+# secpanel-guard — remote lockout guard (dead-man auto-rollback)
+#                  (dead-man switch with automatic rollback)
+#
+# Before a change that could cut your own connection (firewall / network / sshd),
+# take a snapshot and start a timer. Unless you confirm with 'ok' within the time
+# limit, systemd restores the snapshot. The timer is held by systemd (PID 1), so
+# the rollback runs even if the SSH session dies.
+#
+# Language: SECPANEL_LANG=en|ko or /etc/secpanel/lang
+#
+set -uo pipefail
+
+SNAP_ROOT="/var/lib/secpanel-guard"
+ACTIVE="$SNAP_ROOT/active"
+UNIT="secpanel-guard"          # name of the transient systemd-run unit
+WARN_UNIT="secpanel-guard-warn" # unit for the reminders before a rollback
+WARN_BEFORE=60                  # how many seconds before the rollback to start reminding
+WARN_EVERY=10                   # seconds between reminders
+GLOG="/var/log/secpanel-guard.log"   # arm / confirm / rollback history (root only)
+DEFAULT_TIMEOUT=300
+
+# --- language (i18n) ---
+LANG_FILE="/etc/secpanel/lang"
+# Priority: SECPANEL_LANG > /etc/secpanel/lang > package default (UI_LANG) > English
+GLANG="en"
+_gl="${SECPANEL_LANG:-}"
+[[ -z "$_gl" && -r "$LANG_FILE" ]] && _gl="$(cat "$LANG_FILE" 2>/dev/null)"
+[[ -z "$_gl" && -r /usr/share/secpanel/defaults.conf ]] && \
+    _gl="$(sed -n 's/^UI_LANG=//p' /usr/share/secpanel/defaults.conf 2>/dev/null | head -n 1)"
+case "$_gl" in ko|KO|korean) GLANG="ko" ;; *) GLANG="en" ;; esac
+L() { if [[ "$GLANG" == "en" ]]; then printf '%s' "$2"; else printf '%s' "$1"; fi; }
+
+need_root() { [[ $EUID -eq 0 ]] || { echo "$(L 'root 권한 필요' 'root required'): sudo secpanel-guard $*"; exit 1; }; }
+# Log through logger only when interactive (terminal). Under systemd, stdout already goes
+# to the journal (SYSLOG_IDENTIFIER=secpanel-guard), so this avoids duplicate entries.
+log() { echo "$*"; if [[ -t 1 ]]; then logger -t secpanel-guard "$*" 2>/dev/null; fi; return 0; }
+
+# Append one line to the history file (so you can see later when it was armed, confirmed or rolled back)
+hist() { ( umask 077; printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$GLOG" ) 2>/dev/null; return 0; }
+who_ran() { echo "${SUDO_USER:-$(id -un 2>/dev/null)}"; }
+
+# One-line notice to logged-in terminals. Terminals showing the secpanel menu are skipped
+# (secpanel shows the remaining time on its top line there, so the text does not overlap the screen).
+notify() {
+    local msg="$1" line dev
+    while read -r line; do
+        dev="/dev/$line"
+        [[ -c "$dev" ]] || continue
+        ps -t "$line" -o args= 2>/dev/null | grep -Eq '(^|[ /])secpanel( |$)' && continue
+        timeout 2 sh -c 'printf "\r\n%s\r\n" "$1" > "$2"' _ "$msg" "$dev" 2>/dev/null
+    done < <(who 2>/dev/null | awk '{print $2}' | sort -u)
+    return 0
+}
+
+timer_active() { systemctl is-active --quiet "${UNIT}.timer" 2>/dev/null; }
+has_target() { [[ ",$1," == *",$2,"* || ",$1," == *",all,"* ]]; }
+
+# --------------------------------------------------------------------------
+# snapshot <targets-csv>
+snapshot() {
+    local targets="${1:-all}"
+    rm -rf "$ACTIVE"; mkdir -p "$ACTIVE"
+    echo "$targets" > "$ACTIVE/targets"
+
+    if has_target "$targets" firewall; then
+        if systemctl is-active --quiet firewalld 2>/dev/null; then
+            cp -a /etc/firewalld "$ACTIVE/firewalld" 2>/dev/null
+            echo yes > "$ACTIVE/firewalld.active"
+        fi
+        command -v nft >/dev/null 2>&1 && nft list ruleset > "$ACTIVE/ruleset.nft" 2>/dev/null
+    fi
+    if has_target "$targets" sshd; then
+        [[ -f /etc/ssh/sshd_config ]] && cp -a /etc/ssh/sshd_config "$ACTIVE/sshd_config"
+        [[ -d /etc/ssh/sshd_config.d ]] && cp -a /etc/ssh/sshd_config.d "$ACTIVE/sshd_config.d"
+    fi
+    if has_target "$targets" network; then
+        [[ -d /etc/NetworkManager/system-connections ]] && \
+            cp -a /etc/NetworkManager/system-connections "$ACTIVE/nm-connections"
+    fi
+    chmod -R go-rwx "$ACTIVE" 2>/dev/null
+}
+
+# do_rollback <snapshot dir> <auto|manual>
+do_rollback() {
+    local dir="${1:-$ACTIVE}" mode="${2:-manual}" targets armed done_at
+    [[ -d "$dir" ]] || { log "$(L '롤백 스냅샷 없음' 'no rollback snapshot'): $dir"; return 1; }
+    targets="$(cat "$dir/targets" 2>/dev/null)"
+    armed="$(date -d "@$(cat "$dir/armed_at" 2>/dev/null)" '+%H:%M:%S' 2>/dev/null)"
+    log "$(L '=== 롤백 시작 ===' '=== rollback start ===') ($dir)"
+
+    # restore sshd
+    if [[ -f "$dir/sshd_config" ]]; then
+        cp -af "$dir/sshd_config" /etc/ssh/sshd_config
+        [[ -d "$dir/sshd_config.d" ]] && { rm -rf /etc/ssh/sshd_config.d; cp -a "$dir/sshd_config.d" /etc/ssh/sshd_config.d; }
+        if sshd -t 2>/dev/null; then
+            systemctl try-restart sshd 2>/dev/null && log "$(L 'sshd 설정 복구 + 재시작(기존 세션 유지)' 'sshd config restored + restarted (existing sessions kept)')"
+        else
+            log "$(L '경고: 복구된 sshd_config 검증 실패 — 재시작 생략' 'warning: restored sshd_config failed validation — skip restart')"
+        fi
+    fi
+
+    # restore the firewall
+    if [[ -d "$dir/firewalld" && -f "$dir/firewalld.active" ]]; then
+        rm -rf /etc/firewalld; cp -a "$dir/firewalld" /etc/firewalld
+        firewall-cmd --complete-reload 2>/dev/null && log "$(L 'firewalld 영구설정 복구 + reload' 'firewalld permanent config restored + reload')"
+    elif [[ -f "$dir/ruleset.nft" ]]; then
+        nft -f "$dir/ruleset.nft" 2>/dev/null && log "$(L 'nftables 룰셋 복구' 'nftables ruleset restored')"
+    fi
+
+    # restore NetworkManager - restore the files and really re-apply them (reactivate)
+    if [[ -d "$dir/nm-connections" ]]; then
+        rm -rf /etc/NetworkManager/system-connections
+        cp -a "$dir/nm-connections" /etc/NetworkManager/system-connections
+        command -v restorecon >/dev/null 2>&1 && \
+            restorecon -R /etc/NetworkManager/system-connections 2>/dev/null
+        nmcli connection reload 2>/dev/null
+        local _dev
+        for _dev in $(nmcli -t -f DEVICE,STATE device status 2>/dev/null \
+                      | awk -F: '$2=="disconnected"{print $1}'); do
+            nmcli device connect "$_dev" 2>/dev/null
+        done
+        local _n _a _d
+        while IFS=: read -r _n _a _d; do
+            [[ -z "$_n" ]] && continue
+            if [[ "$_a" == "yes" && -n "$_d" ]]; then
+                nmcli device reapply "$_d" 2>/dev/null || nmcli connection up "$_n" 2>/dev/null
+            else
+                nmcli connection up "$_n" 2>/dev/null
+            fi
+        done < <(nmcli -t -f NAME,ACTIVE,DEVICE connection show 2>/dev/null)
+        systemctl is-active --quiet firewalld && firewall-cmd --reload >/dev/null 2>&1
+        if nmcli -t -f DEVICE,STATE device status 2>/dev/null | grep -qE ':(disconnected|unavailable)$'; then
+            systemctl restart NetworkManager >/dev/null 2>&1
+            sleep 2
+            systemctl is-active --quiet firewalld && firewall-cmd --reload >/dev/null 2>&1
+        fi
+        log "$(L 'NetworkManager 연결 복구 + 재적용 + 존 재바인딩' 'NetworkManager connections restored + reapplied + zone rebound')"
+    fi
+
+    log "$(L '=== 롤백 완료 ===' '=== rollback done ===')"
+
+    # Record that a rollback happened: marker file (for the secpanel screen) + history file + journal + terminal notice
+    date +%s > "$dir/rolled_back" 2>/dev/null
+    done_at="$(date '+%H:%M:%S')"
+    if [[ "$mode" == auto ]]; then
+        hist "$(L "자동 원복   [${targets}] 시간 안에 확정하지 않아 ${armed:-?} 상태로 되돌림" \
+                  "AUTO-ROLLBACK [${targets}] not confirmed in time, reverted to the ${armed:-?} state")"
+        log "$(L "자동 원복 완료: 확정하지 않아 [${targets}] 설정을 안전장치를 켠 시점(${armed:-?})으로 되돌렸습니다." \
+                 "auto-rollback done: [${targets}] reverted to the state at arm time (${armed:-?}) because it was not confirmed.")"
+        notify "[secpanel-guard] $(L "${done_at} 자동 원복 완료 — 확정하지 않아 [${targets}] 설정을 안전장치를 켠 시점(${armed:-?})으로 되돌렸습니다. 기록: sudo secpanel-guard log" \
+                                     "${done_at} auto-rollback done — [${targets}] reverted to the state at arm time (${armed:-?}). History: sudo secpanel-guard log")"
+    else
+        hist "$(L "수동 원복   [${targets}] $(who_ran) 가 즉시 롤백 실행, ${armed:-?} 상태로 되돌림" \
+                  "MANUAL-ROLLBACK [${targets}] by $(who_ran), reverted to the ${armed:-?} state")"
+        log "$(L "수동 원복 완료: [${targets}] 설정을 안전장치를 켠 시점(${armed:-?})으로 되돌렸습니다." \
+                 "manual rollback done: [${targets}] reverted to the state at arm time (${armed:-?}).")"
+    fi
+}
+
+# From WARN_BEFORE seconds before the rollback, every WARN_EVERY seconds, show a one-line notice on logged-in terminals.
+# (Terminals showing the secpanel menu are skipped. Nothing happens if nobody is logged in; a failed notice does not affect the rollback)
+do_warn() {
+    local at to left msg
+    while timer_active && [[ -f "$ACTIVE/armed_at" && -f "$ACTIVE/timeout" && ! -f "$ACTIVE/confirmed" ]]; do
+        at="$(cat "$ACTIVE/armed_at")"; to="$(cat "$ACTIVE/timeout")"
+        left=$(( at + to - $(date +%s) ))
+        (( left <= 2 )) && break
+        msg="[secpanel-guard] $(L "${left}초 뒤 [$(cat "$ACTIVE/targets" 2>/dev/null)] 설정을 자동으로 되돌립니다. 변경을 유지하려면:  sudo secpanel-guard ok" \
+                                  "Auto-rollback of [$(cat "$ACTIVE/targets" 2>/dev/null)] in ${left}s. To keep your changes:  sudo secpanel-guard ok")"
+        echo "$msg"
+        notify "$msg"
+        (( left <= WARN_EVERY )) && break
+        sleep "$WARN_EVERY"
+    done
+}
+
+disarm_timer() {
+    systemctl stop "${WARN_UNIT}.timer" "${WARN_UNIT}.service" 2>/dev/null
+    systemctl reset-failed "${WARN_UNIT}.timer" "${WARN_UNIT}.service" 2>/dev/null
+    systemctl stop "${UNIT}.timer" 2>/dev/null
+    systemctl stop "${UNIT}.service" 2>/dev/null
+    systemctl reset-failed "${UNIT}.timer" "${UNIT}.service" 2>/dev/null
+}
+
+# --------------------------------------------------------------------------
+cmd_arm() {
+    need_root arm
+    local timeout="$DEFAULT_TIMEOUT" note="" targets="all"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --timeout) timeout="$2"; shift 2;;
+            --note)    note="$2"; shift 2;;
+            --targets) targets="$2"; shift 2;;
+            *) shift;;
+        esac
+    done
+    if timer_active; then
+        echo "$(L "이미 가드가 걸려 있습니다. 먼저 'secpanel-guard ok' 로 확정하거나 rollback 하세요." \
+                 "A guard is already armed. Confirm with 'secpanel-guard ok' or roll back first.")"
+        cmd_status; return 1
+    fi
+
+    echo "$(L '상태 스냅샷 생성 중...' 'Creating state snapshot...') ($(L '대상' 'targets'): $targets)"
+    snapshot "$targets"
+    date +%s > "$ACTIVE/armed_at"
+    echo "$timeout" > "$ACTIVE/timeout"
+    echo "$note" > "$ACTIVE/note"
+
+    # If a previously fired unit has not been collected yet, its name remains and systemd-run fails silently -> clean up first
+    systemctl stop "${UNIT}.timer" "${UNIT}.service" "${WARN_UNIT}.timer" "${WARN_UNIT}.service" >/dev/null 2>&1
+    systemctl reset-failed "${UNIT}.timer" "${UNIT}.service" "${WARN_UNIT}.timer" "${WARN_UNIT}.service" >/dev/null 2>&1
+
+    # transient systemd-run timer (PID 1 runs it even if the session dies). The language is passed along.
+    local runerr
+    runerr="$(systemd-run --unit="$UNIT" --on-active="${timeout}" --timer-property=AccuracySec=1s \
+        --setenv=SECPANEL_LANG="$GLANG" \
+        --collect /usr/bin/secpanel-guard __rollback "$ACTIVE" 2>&1)"
+    local rc=$?
+    if [[ $rc -ne 0 ]] || ! timer_active; then
+        rm -rf "$ACTIVE"
+        if [[ "$GLANG" == "en" ]]; then
+            cat <<EOF
+!!!! GUARD ARM FAILED — auto-rollback was NOT scheduled !!!!
+     Do NOT proceed with risky changes. (cause: ${runerr:-unknown})
+     Check 'sudo secpanel-guard status'.
+EOF
+        else
+            cat <<EOF
+!!!! 안전장치 설정 실패 — 자동 롤백이 예약되지 않았습니다 !!!!
+     위험 작업을 진행하지 마세요. (원인: ${runerr:-unknown})
+     'sudo secpanel-guard status' 로 상태를 확인하세요.
+EOF
+        fi
+        return 1
+    fi
+
+    # Schedule reminders from one minute before the rollback (at once if the time is a minute or less). A failure here does not affect the guard
+    local warn_in=$(( timeout - WARN_BEFORE ))
+    (( warn_in < 1 )) && warn_in=1
+    systemd-run --unit="$WARN_UNIT" --on-active="${warn_in}" --timer-property=AccuracySec=1s \
+        --setenv=SECPANEL_LANG="$GLANG" --collect /usr/bin/secpanel-guard __warn >/dev/null 2>&1
+
+    log "$(L "가드 ARM: ${timeout}초 후 자동 롤백 예약" "guard ARM: auto-rollback in ${timeout}s") ($(L '대상' 'targets'): $targets, note: ${note:-none})"
+    hist "$(L "안전장치 켬 [${targets}] $(who_ran), ${timeout}초 뒤 자동 원복 예약${note:+, 메모: $note}" \
+              "ARM [${targets}] by $(who_ran), auto-rollback in ${timeout}s${note:+, note: $note}")"
+    if [[ "$GLANG" == "en" ]]; then
+        cat <<EOF
+
+  ================================================================
+   GUARD ON — verify your access within ${timeout}s.
+     targets: $targets
+
+     access OK   ->  sudo secpanel-guard ok      (cancel auto-rollback)
+     locked out  ->  auto-revert [$targets] after ${timeout}s
+     A reminder is shown on logged-in terminals every ${WARN_EVERY}s
+     during the last ${WARN_BEFORE}s (inside secpanel: top-right of the screen).
+  ================================================================
+EOF
+    else
+        cat <<EOF
+
+  ================================================================
+   안전장치 ON — ${timeout}초 안에 접속이 살아있는지 확인하세요.
+     대상: $targets
+
+     접속 정상  ->  sudo secpanel-guard ok      (자동 롤백 취소)
+     락아웃됨   ->  ${timeout}초 뒤 [$targets] 자동 원복
+     되돌리기 ${WARN_BEFORE}초 전부터 ${WARN_EVERY}초마다, 접속해 있는 터미널에 알림이 뜹니다.
+     (secpanel 화면에서는 맨 위 오른쪽에 남은 시간이 표시됩니다)
+  ================================================================
+EOF
+    fi
+}
+
+cmd_ok() {
+    need_root ok
+    if ! timer_active; then echo "$(L '걸려 있는 가드가 없습니다.' 'No guard is armed.')"; return 0; fi
+    disarm_timer
+    [[ -d "$ACTIVE" ]] && touch "$ACTIVE/confirmed"
+    log "$(L '가드 확정(OK): 자동 롤백 취소됨. 변경사항 유지.' 'Guard confirmed (OK): auto-rollback cancelled. Changes kept.')"
+    hist "$(L "확정        [$(cat "$ACTIVE/targets" 2>/dev/null)] $(who_ran), 변경 유지 (자동 원복 취소)" \
+              "CONFIRM [$(cat "$ACTIVE/targets" 2>/dev/null)] by $(who_ran), changes kept (auto-rollback cancelled)")"
+}
+
+cmd_status() {
+    if timer_active; then
+        echo "$(L '가드 상태: ARM (자동 롤백 대기 중)' 'Guard: ARMED (auto-rollback pending)')"
+        if [[ -f "$ACTIVE/armed_at" && -f "$ACTIVE/timeout" ]]; then
+            local at to due left
+            at="$(cat "$ACTIVE/armed_at")"; to="$(cat "$ACTIVE/timeout")"
+            due=$((at + to)); left=$((due - $(date +%s)))
+            (( left < 0 )) && left=0
+            echo "$(L '자동 롤백 예정' 'auto-rollback at'): $(date -d "@$due" '+%H:%M:%S')  ($(L '남은 시간' 'remaining') $((left / 60))$(L '분' 'm') $((left % 60))$(L '초' 's'))"
+        fi
+        [[ -f "$ACTIVE/targets" ]] && echo "$(L '대상' 'targets'): $(cat "$ACTIVE/targets")"
+        [[ -s "$ACTIVE/note" ]] && echo "$(L '메모' 'note'): $(cat "$ACTIVE/note")"
+        echo
+        echo "$(L '접속이 정상이면 확정' 'access OK -> confirm'):  sudo secpanel-guard ok"
+        echo "$(L '지금 바로 되돌리기' 'roll back now'):      sudo secpanel-guard rollback"
+    else
+        echo "$(L '가드 상태: 없음 (안전장치 꺼짐)' 'Guard: none (off)')"
+        [[ -s "$GLOG" ]] && echo "$(L '마지막 기록' 'last event'): $(tail -n 1 "$GLOG")"
+    fi
+}
+
+cmd_rollback() {
+    need_root rollback
+    disarm_timer
+    do_rollback "$ACTIVE" manual
+}
+
+cmd_log() {
+    need_root log
+    if [[ ! -s "$GLOG" ]]; then echo "$(L '아직 기록이 없습니다.' 'No history yet.')"; return 0; fi
+    echo "$(L '작업 안전장치 기록 (최근 것이 아래)' 'Guard history (newest last)')  —  $GLOG"
+    echo
+    tail -n "${1:-50}" "$GLOG"
+}
+
+usage() {
+    if [[ "$GLANG" == "en" ]]; then
+        cat <<EOF
+secpanel-guard — remote lockout guard (dead-man auto-rollback)
+
+  sudo secpanel-guard arm [--timeout SEC] [--note "text"] [--targets LIST]
+       snapshot + schedule auto-rollback before risky changes
+       --targets: comma of firewall,sshd,network (default: all)
+                  e.g. --targets firewall,sshd
+  sudo secpanel-guard ok         access confirmed -> cancel auto-rollback
+  sudo secpanel-guard status     show current guard status
+  sudo secpanel-guard rollback   roll back to the snapshot now
+  sudo secpanel-guard log [N]    show history (arm / confirm / rollback), last N lines
+
+e.g. before changing firewall rules:
+  sudo secpanel-guard arm --timeout 120 --note "port change"
+  # ...edit firewall via secpanel...
+  # if you still have access:
+  sudo secpanel-guard ok
+EOF
+    else
+        cat <<EOF
+secpanel-guard — 원격 락아웃 방지 (dead-man 자동 롤백)
+
+  sudo secpanel-guard arm [--timeout 초] [--note "설명"] [--targets 목록]
+       위험 작업 전 스냅샷 + 자동 롤백 타이머
+       --targets: firewall,sshd,network 중 콤마로 선택 (기본 all)
+                  예) --targets firewall,sshd
+  sudo secpanel-guard ok         접속 정상 확인 -> 자동 롤백 취소(확정)
+  sudo secpanel-guard status     현재 가드 상태
+  sudo secpanel-guard rollback   지금 즉시 수동 롤백
+  sudo secpanel-guard log [N]    켬·확정·원복 기록 보기 (최근 N줄, 기본 50)
+
+예) 방화벽 규칙 바꾸기 전:
+  sudo secpanel-guard arm --timeout 120 --note "포트정책 변경"
+  # ...secpanel 로 방화벽 수정...
+  # 접속 여전히 되면:
+  sudo secpanel-guard ok
+EOF
+    fi
+}
+
+case "${1:-}" in
+    arm)        shift; cmd_arm "$@";;
+    ok|confirm) cmd_ok;;
+    status)     cmd_status;;
+    rollback)   cmd_rollback;;
+    log)        shift; cmd_log "$@";;
+    __rollback) shift; do_rollback "${1:-$ACTIVE}" auto;;   # called by the systemd timer (internal)
+    __warn)     do_warn;;                               # reminder before the rollback (internal)
+    *)          usage;;
+esac
