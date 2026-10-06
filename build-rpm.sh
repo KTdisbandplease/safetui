@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 #
-# Build the secpanel RPM.
+# Build the safetui RPM.
 # Run on RHEL / Rocky / AlmaLinux 9 (or anywhere rpmbuild is available).
 #
 #   sudo dnf install -y rpm-build rpmdevtools
 #   ./build-rpm.sh
 #
-# Result: ~/rpmbuild/RPMS/noarch/secpanel-<version>-1.*.noarch.rpm
+# Result: ~/rpmbuild/RPMS/noarch/safetui-<version>-1.*.noarch.rpm
 #
 set -euo pipefail
 
-NAME=secpanel
-VERSION=2.12.0
+NAME=safetui
+VERSION=3.0.0
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 command -v rpmbuild >/dev/null 2>&1 || {
@@ -26,8 +26,8 @@ rpmdev-setuptree 2>/dev/null || mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SR
 STAGE="$(mktemp -d)"
 DEST="$STAGE/${NAME}-${VERSION}"
 mkdir -p "$DEST/src"
-install -m 0755 "$HERE/src/secpanel"       "$DEST/src/secpanel"
-install -m 0755 "$HERE/src/secpanel-guard" "$DEST/src/secpanel-guard"
+install -m 0755 "$HERE/src/safetui"       "$DEST/src/safetui"
+install -m 0755 "$HERE/src/safetui-guard" "$DEST/src/safetui-guard"
 install -m 0644 "$HERE/src/dialogrc"       "$DEST/src/dialogrc"
 install -m 0644 "$HERE/README.md"          "$DEST/README.md"
 install -m 0644 "$HERE/LICENSE"            "$DEST/LICENSE"

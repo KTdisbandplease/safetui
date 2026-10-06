@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
 #
-# secpanel - Firewall / SELinux / lockout guard / backup TUI
+# safetui - Firewall / SELinux / lockout guard / backup TUI
 #
 # RHEL / Rocky / AlmaLinux 9.
-# Built on dialog. English / Korean UI (Language menu or SECPANEL_LANG=en|ko). English by default.
+# Built on dialog. English / Korean UI (Language menu or SAFETUI_LANG=en|ko). English by default.
 #
 # Depends on: dialog, firewalld(firewall-cmd), policycoreutils,
 #         policycoreutils-python-utils(semanage/audit2allow), setools-console
 #
 set -o pipefail
 
-APP_NAME="secpanel"
-APP_VERSION="2.12.0"
+APP_NAME="safetui"
+APP_VERSION="3.0.0"
 
 # ---------------------------------------------------------------------------
 # Language (i18n)
 # ---------------------------------------------------------------------------
-LANG_FILE="/etc/secpanel/lang"
+LANG_FILE="/etc/safetui/lang"
 LANG_MODE="en"
 
 # Optional defaults file shipped by a package. key=value format.
 #   UI_LANG=ko|en            UI language on first run
 #   DB_HOME / DB_DIR / ...   defaults for the backup settings (same keys as backup.conf)
-# Values the user changed in the menu (/etc/secpanel/) always win.
-VENDOR_DEFAULTS="/usr/share/secpanel/defaults.conf"
+# Values the user changed in the menu (/etc/safetui/) always win.
+VENDOR_DEFAULTS="/usr/share/safetui/defaults.conf"
 vendor_default() {  # $1=key -> value (empty if not set)
     [[ -r "$VENDOR_DEFAULTS" ]] || return 0
     local k v
@@ -33,9 +33,9 @@ vendor_default() {  # $1=key -> value (empty if not set)
     return 0
 }
 
-# Priority: env SECPANEL_LANG > value chosen in the menu (/etc/secpanel/lang) > package default > English
+# Priority: env SAFETUI_LANG > value chosen in the menu (/etc/safetui/lang) > package default > English
 detect_lang() {
-    local l="${SECPANEL_LANG:-}"
+    local l="${SAFETUI_LANG:-}"
     [[ -z "$l" && -r "$LANG_FILE" ]] && l="$(cat "$LANG_FILE" 2>/dev/null)"
     [[ -z "$l" ]] && l="$(vendor_default UI_LANG)"
     case "$l" in ko|KO|korean) LANG_MODE="ko" ;; *) LANG_MODE="en" ;; esac
@@ -43,14 +43,14 @@ detect_lang() {
 save_lang() {
     mkdir -p "$(dirname "$LANG_FILE")" 2>/dev/null
     printf '%s\n' "$LANG_MODE" > "$LANG_FILE" 2>/dev/null
-    export SECPANEL_LANG="$LANG_MODE"   # child tools (secpanel-guard) use the same language
+    export SAFETUI_LANG="$LANG_MODE"   # child tools (safetui-guard) use the same language
 }
 # L "<korean>" "<english>"  - return the string for the current language
 L() { if [[ "$LANG_MODE" == "en" ]]; then printf '%s' "$2"; else printf '%s' "$1"; fi; }
 
 detect_lang
-export SECPANEL_LANG="$LANG_MODE"   # pass the language to child processes such as secpanel-guard
-BACKTITLE="secpanel ${APP_VERSION} — $(L '방화벽·SELinux·작업 안전장치·백업' 'Firewall·SELinux·Guard·Backup')"
+export SAFETUI_LANG="$LANG_MODE"   # pass the language to child processes such as safetui-guard
+BACKTITLE="safetui ${APP_VERSION} — $(L '방화벽·SELinux·작업 안전장치·백업' 'Firewall·SELinux·Guard·Backup')"
 
 # default dialog window size
 DLG_H=22
@@ -58,13 +58,13 @@ DLG_W=76
 MENU_H=12
 
 # color theme that shows the input field in reverse video (used if present)
-for _rc in /usr/share/secpanel/dialogrc "$(dirname "$0")/dialogrc"; do
+for _rc in /usr/share/safetui/dialogrc "$(dirname "$0")/dialogrc"; do
     [[ -f "$_rc" ]] && { export DIALOGRC="$_rc"; break; }
 done
 
 # Temporary files
 # root-only (700) temp directory - derived files (.avc etc.) are safe from /tmp symlink attacks
-TMP_DIR="$(mktemp -d /tmp/secpanel.XXXXXX)"
+TMP_DIR="$(mktemp -d /tmp/safetui.XXXXXX)"
 TMP_OUT="$TMP_DIR/out"
 : >"$TMP_OUT"
 EXIT_NOTE=""      # note to leave on the terminal after exit (only if set)
@@ -93,8 +93,8 @@ die() { echo "$(L '오류' 'Error'): $*" >&2; exit 1; }
 
 need_root() {
     if [[ $EUID -ne 0 ]]; then
-        echo "$(L "이 도구는 root 권한이 필요합니다. 'sudo secpanel' 로 실행하세요." \
-                "This tool requires root. Run 'sudo secpanel'.")" >&2
+        echo "$(L "이 도구는 root 권한이 필요합니다. 'sudo safetui' 로 실행하세요." \
+                "This tool requires root. Run 'sudo safetui'.")" >&2
         exit 1
     fi
 }
@@ -165,7 +165,7 @@ show_text() {
 #   After a rollback, "Rolled back HH:MM:SS" is shown on green for 10 minutes.
 #   The cursor is saved / restored (ESC 7 / ESC 8) and only that spot is overwritten, so the menu is untouched.
 # ---------------------------------------------------------------------------
-GUARD_ACTIVE="/var/lib/secpanel-guard/active"
+GUARD_ACTIVE="/var/lib/safetui-guard/active"
 GUARD_TXT=""; GUARD_COLOR=""
 guard_ticker_text() {
     local now at to left rb
@@ -286,7 +286,7 @@ valid_port()   { [[ "$1" =~ ^[0-9]{1,5}(-[0-9]{1,5})?$ ]]; }
 valid_ipcidr() { [[ "$1" =~ ^[0-9A-Fa-f:.]+(/[0-9]{1,3})?$ ]]; }
 
 # --- warning before a change that can cut the remote session ---
-guard_armed() { systemctl is-active --quiet secpanel-guard.timer 2>/dev/null; }
+guard_armed() { systemctl is-active --quiet safetui-guard.timer 2>/dev/null; }
 
 # ports SSH listens on (from the sshd configuration, there can be several)
 remote_access_ports() {
@@ -312,7 +312,7 @@ port_hits_remote() {
 lockout_check() {
     local what="$1" sel
     guard_armed && return 0
-    need_cmd secpanel-guard || return 0
+    need_cmd safetui-guard || return 0
     sel="$(dlg --title "$(L '[주의] 원격 접속이 끊길 수 있는 작업' '[CAUTION] This may cut remote access')" \
         --cancel-label "$(L '취소' 'Cancel')" --menu \
         "$(L "지금 하려는 작업:" "About to:") $what\n\n$(L "잘못되면 SSH 접속이 끊겨 서버에 다시 못 들어올 수 있습니다.\n작업 안전장치를 켜두면, 5분 안에 '확정'하지 않을 경우\n방화벽이 자동으로 원래대로 돌아옵니다." \
@@ -321,7 +321,7 @@ lockout_check() {
         arm  "$(L '안전장치 켜고 진행 (권장)' 'Arm the guard, then proceed (recommended)')" \
         skip "$(L '안전장치 없이 그냥 진행' 'Proceed without the guard')")" || return 1
     if [[ "$sel" == "arm" ]]; then
-        if secpanel-guard arm --timeout 300 --targets firewall --note "secpanel: $what" >"$TMP_OUT" 2>&1; then
+        if safetui-guard arm --timeout 300 --targets firewall --note "safetui: $what" >"$TMP_OUT" 2>&1; then
             msg "$(L '안전장치 켜짐' 'Guard armed')" \
                 "$(L "안전장치가 켜졌습니다 (5분).\n\n작업 후 새 SSH 창으로 접속이 되는지 확인하고,\n메인 메뉴 → 작업 안전장치 → '확정(ok)' 을 누르세요.\n확정하지 않으면 5분 뒤 자동으로 원래대로 돌아갑니다." \
                      "The guard is armed (5 minutes).\n\nAfter the change, open a NEW SSH window to check access, then\nMain menu → Lockout guard → 'Confirm (ok)'.\nIf not confirmed, it reverts automatically after 5 minutes.")" 14
@@ -926,7 +926,7 @@ se_audit2allow() {
         --textbox "$TMP_OUT" "$DLG_H" "$DLG_W"
 
     if yesno "$(L '확인' 'Confirm')" "$(L '위 정책을 실제로 컴파일하여 시스템에 적용할까요?' 'Compile and apply this policy to the system?')\n\n  $(L '모듈' 'module'): $modname\n\n$(L '(주의: allow 줄이 해결하려는 프로그램에 대한 것인지\n 미리보기에서 꼭 확인하세요)' '(Caution: check in the preview that the allow lines\n are only for the program you are fixing)')" 12; then
-        local wd; wd="$(mktemp -d /tmp/secpanel-se.XXXXXX)"
+        local wd; wd="$(mktemp -d /tmp/safetui-se.XXXXXX)"
         (
             cd "$wd" || exit 1
             audit2allow -M "$modname" <"$denials" >/dev/null || exit 1
@@ -1004,16 +1004,16 @@ selinux_menu() {
 }
 
 # ---------------------------------------------------------------------------
-# Lockout guard (wraps secpanel-guard)
+# Lockout guard (wraps safetui-guard)
 # ---------------------------------------------------------------------------
 guard_menu() {
-    if ! need_cmd secpanel-guard; then
-        msg "$(L '안전장치(가드)' 'Lockout guard')" "$(L 'secpanel-guard 가 설치되어 있지 않습니다.' 'secpanel-guard is not installed.')"
+    if ! need_cmd safetui-guard; then
+        msg "$(L '안전장치(가드)' 'Lockout guard')" "$(L 'safetui-guard 가 설치되어 있지 않습니다.' 'safetui-guard is not installed.')"
         return
     fi
     while true; do
         local status_line choice
-        status_line="$(secpanel-guard status 2>/dev/null | head -1)"
+        status_line="$(safetui-guard status 2>/dev/null | head -1)"
         choice="$(dlg --title "$(L '작업 안전장치 (원격 락아웃 방지)' 'Lockout guard')" --cancel-label "$(L '뒤로' 'Back')" \
             --menu "$(L '방화벽/네트워크/sshd 를 위험하게 바꾸기 전에 켜두면,\n확정 안 할 시 자동으로 원상복구됩니다.' \
                        'Arm before risky firewall/network/sshd changes;\nif not confirmed, it auto-reverts.')\n\n$(L '현재' 'Now'): ${status_line}" \
@@ -1042,14 +1042,14 @@ guard_menu() {
                     continue
                 fi
                 note="$(dlg_input "$(L '메모(선택)' 'Note (optional)')" "$(L '무슨 작업인지 메모 (선택)' 'What are you doing? (optional)')")" || note=""
-                run_show "$(L '안전장치 켜기' 'Arm guard')" secpanel-guard arm --timeout "$t" --targets "$targets" --note "$note"
+                run_show "$(L '안전장치 켜기' 'Arm guard')" safetui-guard arm --timeout "$t" --targets "$targets" --note "$note"
                 ;;
-            2) run_show "$(L '확정(ok)' 'Confirm (ok)')" secpanel-guard ok ;;
-            3) show_text "$(L '가드 상태' 'Guard status')" secpanel-guard status ;;
+            2) run_show "$(L '확정(ok)' 'Confirm (ok)')" safetui-guard ok ;;
+            3) show_text "$(L '가드 상태' 'Guard status')" safetui-guard status ;;
             4) if yesno "$(L '즉시 롤백' 'Roll back now')" "$(L '지금 즉시 스냅샷 상태로 되돌립니다.\n진행할까요?' 'Revert to the snapshot state now.\nProceed?')"; then
-                   run_show "$(L '즉시 롤백' 'Roll back now')" secpanel-guard rollback
+                   run_show "$(L '즉시 롤백' 'Roll back now')" safetui-guard rollback
                fi ;;
-            5) show_text "$(L '작업 안전장치 기록' 'Guard history')" secpanel-guard log ;;
+            5) show_text "$(L '작업 안전장치 기록' 'Guard history')" safetui-guard log ;;
         esac
     done
 }
@@ -1057,8 +1057,8 @@ guard_menu() {
 # ---------------------------------------------------------------------------
 # Backup - files and folders / MariaDB
 # ---------------------------------------------------------------------------
-BK_CONF="/etc/secpanel/backup.conf"
-BK_HIST="/var/log/secpanel-backup.log"   # file backup history (time<TAB>source<TAB>backup)
+BK_CONF="/etc/safetui/backup.conf"
+BK_HIST="/var/log/safetui-backup.log"   # file backup history (time<TAB>source<TAB>backup)
 
 # Default settings (bk_load overrides them when backup.conf exists)
 BK_DB_HOME="/usr"                         # MariaDB install path (bin/mariadb-dump under it is used)
@@ -1077,7 +1077,7 @@ BK_SCHED="off"                            # scheduled DB backup: off | daily | w
 BK_SCHED_DOW="Mon"                        # weekday for weekly (Mon..Sun)
 BK_SCHED_DOM="1"                          # day for monthly (1-28) or last (last day of the month)
 BK_SCHED_TIME="03:00"                     # time of day HH:MM
-BK_UNIT="secpanel-dbbackup"               # systemd unit name of the scheduled backup
+BK_UNIT="safetui-dbbackup"               # systemd unit name of the scheduled backup
 
 declare -A BK_SEL=()    # paths picked in the file browser (an empty value means unselected)
 declare -A BK_USED=()   # backup paths already created in this run
@@ -1442,7 +1442,7 @@ bk_copy_one() {
         esac
     fi
     # Copy under a temporary name and rename, so a failure never leaves a half-copied backup behind
-    part="${dest}.secpanel-part.$$"
+    part="${dest}.safetui-part.$$"
     rm -rf -- "$part"
     if ! cp -a -- "$src" "$part" 2>"$TMP_DIR/cp.err"; then
         rm -rf -- "$part"
@@ -1465,7 +1465,7 @@ bk_copy_one() {
     a="$(stat -c '%U:%G %a' -- "$src" 2>/dev/null)"; b="$(stat -c '%U:%G %a' -- "$dest" 2>/dev/null)"
     BK_MSG="$(L '완료' 'OK')    $src\n     →  $dest\n        $(L '소유자·권한' 'owner/mode'): $b"
     [[ "$a" != "$b" ]] && BK_MSG+="  $(L '(원본과 다름' '(differs from original'): $a)"
-    logger -t secpanel-backup "file backup: $src -> $dest" 2>/dev/null
+    logger -t safetui-backup "file backup: $src -> $dest" 2>/dev/null
     bk_hist_add "$src" "$dest"
     return 0
 }
@@ -1510,7 +1510,7 @@ bk_tar_all() {
                     dest="${destdir%/}/backup${BK_SFX}_$n.tar" ;;
         esac
     fi
-    part="${dest}.secpanel-part.$$"
+    part="${dest}.safetui-part.$$"
     rm -f -- "$part"
     ( umask 077
       find "$@" ! -type l -print0 2>>"$TMP_DIR/cp.err" | sed -z 's|^/||' \
@@ -1530,7 +1530,7 @@ bk_tar_all() {
     BK_MSG="$(L '완료' 'OK')    $#$(L '개 항목을 tar 파일 하나로 묶었습니다' ' items bundled into one tar file')\n     →  $dest\n        $(L '담긴 파일·폴더' 'entries'): ${cnt}$(L '개' ''),  $(L '크기' 'size'): $REPLY\n"
     for p in "$@"; do
         BK_MSG+="        - $p\n"
-        logger -t secpanel-backup "file backup (tar): $p -> $dest" 2>/dev/null
+        logger -t safetui-backup "file backup (tar): $p -> $dest" 2>/dev/null
         bk_hist_add "$p" "$dest"
     done
     BK_MSG+="\n        $(L '내용 보기' 'List')     : tar -tvf $dest\n        $(L '원래 자리에 풀기' 'Restore in place') : tar -C / -xpf $dest\n        $(L '다른 곳에 풀기' 'Extract elsewhere')  : tar -C <$(L '폴더' 'dir')> -xpf $dest"
@@ -1708,7 +1708,7 @@ bk_db_dump_one() {
     fi
     mv -f -- "$part" "$out" || return 1
     BK_LAST_FILE="$out"
-    logger -t secpanel-backup "db backup: $label -> $out" 2>/dev/null
+    logger -t safetui-backup "db backup: $label -> $out" 2>/dev/null
 }
 
 # Run the DB backup without any screen (shared by the menu and the schedule). BK_DUMP must be set.
@@ -1735,16 +1735,16 @@ bk_db_run() {
     (( ok )) || return 1
     # remove old backups only after the new backup succeeded
     for f in "${old[@]}"; do rm -f -- "$f" && (( BK_DB_REMOVED++ )); done
-    (( BK_DB_REMOVED > 0 )) && logger -t secpanel-backup "db backup: removed $BK_DB_REMOVED file(s) older than ${BK_DB_KEEP_DAYS}d in $BK_DB_DIR" 2>/dev/null
+    (( BK_DB_REMOVED > 0 )) && logger -t safetui-backup "db backup: removed $BK_DB_REMOVED file(s) older than ${BK_DB_KEEP_DAYS}d in $BK_DB_DIR" 2>/dev/null
     return 0
 }
 
-# Entry point for the schedule (systemd timer) and the command line:  secpanel --db-backup
+# Entry point for the schedule (systemd timer) and the command line:  safetui --db-backup
 bk_db_cli() {
     local f
     bk_load
     if ! BK_DUMP="$(bk_dump_bin)"; then
-        echo "secpanel: $(L 'MariaDB 덤프 프로그램을 찾지 못했습니다' 'MariaDB dump program not found'): $BK_DB_HOME/bin/mariadb-dump" >&2
+        echo "safetui: $(L 'MariaDB 덤프 프로그램을 찾지 못했습니다' 'MariaDB dump program not found'): $BK_DB_HOME/bin/mariadb-dump" >&2
         return 1
     fi
     if bk_db_run; then
@@ -1752,7 +1752,7 @@ bk_db_cli() {
         (( BK_DB_KEEP_DAYS > 0 )) && echo "$(L '보관 기간이 지나 지운 백업' 'Expired backups removed'): $BK_DB_REMOVED"
         return 0
     fi
-    echo "secpanel: $(L 'DB 백업 실패 (기존 백업은 지우지 않음)' 'DB backup failed (existing backups kept)')" >&2
+    echo "safetui: $(L 'DB 백업 실패 (기존 백업은 지우지 않음)' 'DB backup failed (existing backups kept)')" >&2
     tail -n 8 "$TMP_DIR/dump.err" >&2
     return 1
 }
@@ -1801,7 +1801,7 @@ bk_db() {
 }
 
 # --- scheduled DB backup (systemd timer) ---------------------------------------
-# secpanel does not need to keep running. At the set time systemd runs 'secpanel --db-backup'
+# safetui does not need to keep running. At the set time systemd runs 'safetui --db-backup'
 # once and it exits. A run missed while the server was off happens once after boot (Persistent).
 bk_dow_label() {
     case "$1" in
@@ -1838,10 +1838,10 @@ bk_sched_apply() {
         systemctl daemon-reload >/dev/null 2>&1
         return 0
     fi
-    self="$(readlink -f "$0" 2>/dev/null)"; [[ -x "$self" ]] || self="/usr/bin/secpanel"
+    self="$(readlink -f "$0" 2>/dev/null)"; [[ -x "$self" ]] || self="/usr/bin/safetui"
     cat >"$dir/$BK_UNIT.service" <<EOF
 [Unit]
-Description=secpanel scheduled MariaDB backup (secpanel --db-backup)
+Description=safetui scheduled MariaDB backup (safetui --db-backup)
 
 [Service]
 Type=oneshot
@@ -1851,7 +1851,7 @@ IOSchedulingClass=idle
 EOF
     cat >"$dir/$BK_UNIT.timer" <<EOF
 [Unit]
-Description=secpanel scheduled MariaDB backup timer
+Description=safetui scheduled MariaDB backup timer
 
 [Timer]
 OnCalendar=$cal
@@ -1892,7 +1892,7 @@ bk_sched() {
     bk_load
     while true; do
         choice="$(dlg --title "$(L 'DB 자동 백업 예약' 'Scheduled DB backup')" --cancel-label "$(L '뒤로' 'Back')" \
-            --menu "$(L '정해 둔 시각에 DB 백업을 자동으로 실행합니다. (secpanel 을 켜 둘 필요 없음)' 'Runs the DB backup automatically at the set time. (secpanel need not stay open)')\n\n$(L '현재 예약   :' 'Schedule :') $(bk_sched_label)\n$(L '다음 실행   :' 'Next run :') $(bk_sched_next)\n$(L '마지막 실행 :' 'Last run :') $(bk_sched_last)" \
+            --menu "$(L '정해 둔 시각에 DB 백업을 자동으로 실행합니다. (safetui 를 켜 둘 필요 없음)' 'Runs the DB backup automatically at the set time. (safetui need not stay open)')\n\n$(L '현재 예약   :' 'Schedule :') $(bk_sched_label)\n$(L '다음 실행   :' 'Next run :') $(bk_sched_next)\n$(L '마지막 실행 :' 'Last run :') $(bk_sched_last)" \
             "$DLG_H" "$DLG_W" 6 \
             1 "$(L '매일' 'Every day')" \
             2 "$(L '매주 (요일 선택)' 'Every week (pick a weekday)')" \
@@ -2005,7 +2005,7 @@ show_page() {
 
 info_about_text() {
     if [[ "$LANG_MODE" == "en" ]]; then cat <<EOF
-secpanel ${APP_VERSION}
+safetui ${APP_VERSION}
 
 A menu tool for server work: firewall, SELinux, lockout guard and
 backup in one place. You only pick from menus - no commands to remember.
@@ -2036,13 +2036,13 @@ backup in one place. You only pick from menus - no commands to remember.
   - Scheduled DB backup: daily / weekly / monthly (or last day)
 
 Supported OS : RHEL / Rocky Linux / AlmaLinux 9
-Run as       : root  (sudo secpanel)
+Run as       : root  (sudo safetui)
 Languages    : Korean / English (main menu 5)
-Settings     : /etc/secpanel/
-Version      : secpanel --version   or   rpm -q secpanel
+Settings     : /etc/safetui/
+Version      : safetui --version   or   rpm -q safetui
 EOF
     else cat <<EOF
-secpanel ${APP_VERSION}
+safetui ${APP_VERSION}
 
 방화벽·SELinux·작업 안전장치·백업을 한곳에서 다루는 서버 도구입니다.
 명령어를 외울 필요 없이 메뉴에서 고르기만 하면 됩니다.
@@ -2073,10 +2073,10 @@ secpanel ${APP_VERSION}
   - DB 자동 백업 예약: 매일 / 매주 / 매월(날짜 또는 말일)
 
 지원 OS   : RHEL / Rocky Linux / AlmaLinux 9
-실행 권한 : root  (sudo secpanel)
+실행 권한 : root  (sudo safetui)
 언어      : 한국어 / English (메인 메뉴 5번)
-설정 파일 : /etc/secpanel/
-버전 확인 : secpanel --version   또는   rpm -q secpanel
+설정 파일 : /etc/safetui/
+버전 확인 : safetui --version   또는   rpm -q safetui
 EOF
     fi
 }
@@ -2122,10 +2122,10 @@ info_help_text() {
     Copy important backups to another server as well.
 
 [ Where things are recorded ]
-  Guard history     /var/log/secpanel-guard.log
-  File backups      /var/log/secpanel-backup.log
-  Backup journal    journalctl -t secpanel-backup
-  Scheduled backup  journalctl -u secpanel-dbbackup
+  Guard history     /var/log/safetui-guard.log
+  File backups      /var/log/safetui-backup.log
+  Backup journal    journalctl -t safetui-backup
+  Scheduled backup  journalctl -u safetui-dbbackup
 
 [ Other ]
   - Korean looks broken on a console? Main menu 5 > English.
@@ -2171,10 +2171,10 @@ EOF
     중요한 백업은 다른 서버에도 복사해 두세요.
 
 [ 기록이 남는 곳 ]
-  안전장치 기록     /var/log/secpanel-guard.log
-  파일 백업 이력    /var/log/secpanel-backup.log
-  백업 실행 기록    journalctl -t secpanel-backup
-  자동 백업 기록    journalctl -u secpanel-dbbackup
+  안전장치 기록     /var/log/safetui-guard.log
+  파일 백업 이력    /var/log/safetui-backup.log
+  백업 실행 기록    journalctl -t safetui-backup
+  자동 백업 기록    journalctl -u safetui-dbbackup
 
 [ 그 밖에 ]
   - 콘솔에서 한글이 깨지면: 메인 메뉴 5번 > English
@@ -2248,12 +2248,12 @@ semodule -r <$( ((ko)) && echo '이름' || echo 'name' )>
 
 ==================== $( ((ko)) && echo '작업 안전장치' || echo 'Lockout guard' ) ====================
 # $( ((ko)) && echo '켜기: 300초 안에 확정하지 않으면 방화벽을 자동 원복' || echo 'Arm: revert the firewall unless confirmed within 300s' )
-secpanel-guard arm --timeout 300 --targets firewall --note "<$( ((ko)) && echo '메모' || echo 'note' )>"
+safetui-guard arm --timeout 300 --targets firewall --note "<$( ((ko)) && echo '메모' || echo 'note' )>"
 #   --targets : firewall,sshd,network $( ((ko)) && echo '중에서 쉼표로 (기본 all)' || echo '(comma separated, default all)' )
-secpanel-guard status      # $( ((ko)) && echo '상태·남은 시간' || echo 'state, time left' )
-secpanel-guard ok          # $( ((ko)) && echo '확정 (변경 유지)' || echo 'confirm (keep changes)' )
-secpanel-guard rollback    # $( ((ko)) && echo '지금 바로 되돌리기' || echo 'roll back now' )
-secpanel-guard log         # $( ((ko)) && echo '켬·확정·원복 기록' || echo 'history' )
+safetui-guard status      # $( ((ko)) && echo '상태·남은 시간' || echo 'state, time left' )
+safetui-guard ok          # $( ((ko)) && echo '확정 (변경 유지)' || echo 'confirm (keep changes)' )
+safetui-guard rollback    # $( ((ko)) && echo '지금 바로 되돌리기' || echo 'roll back now' )
+safetui-guard log         # $( ((ko)) && echo '켬·확정·원복 기록' || echo 'history' )
 
 ==================== $( ((ko)) && echo '백업' || echo 'Backup' ) ====================
 # $( ((ko)) && echo '파일·폴더를 소유자·권한 그대로 복사' || echo 'Copy a file / folder keeping owner and mode' )
@@ -2273,18 +2273,18 @@ $db/mariadb-dump -u root -p \\
 gunzip -c <$( ((ko)) && echo '파일' || echo 'file' )>.sql.gz \\
     | $db/mariadb -u root -p <DB>
 
-# $( ((ko)) && echo 'secpanel 에 저장해 둔 설정대로 DB 백업 1회 실행' || echo 'Run the DB backup once with the saved secpanel settings' )
-secpanel --db-backup
+# $( ((ko)) && echo 'safetui 에 저장해 둔 설정대로 DB 백업 1회 실행' || echo 'Run the DB backup once with the saved safetui settings' )
+safetui --db-backup
 
 # $( ((ko)) && echo '자동 백업 예약 확인 / 실행 기록' || echo 'Scheduled backup: next run / log' )
-systemctl list-timers secpanel-dbbackup.timer
-journalctl -u secpanel-dbbackup
+systemctl list-timers safetui-dbbackup.timer
+journalctl -u safetui-dbbackup
 
-==================== secpanel ====================
-secpanel --version         # $( ((ko)) && echo '버전' || echo 'version' )
-secpanel --english         # $( ((ko)) && echo '영어 화면으로 실행(저장됨)' || echo 'run in English (saved)' )
-secpanel --korean          # $( ((ko)) && echo '한국어 화면으로 실행(저장됨)' || echo 'run in Korean (saved)' )
-rpm -q --changelog secpanel | less   # $( ((ko)) && echo '버전별 변경 내용' || echo 'changes by version' )
+==================== safetui ====================
+safetui --version         # $( ((ko)) && echo '버전' || echo 'version' )
+safetui --english         # $( ((ko)) && echo '영어 화면으로 실행(저장됨)' || echo 'run in English (saved)' )
+safetui --korean          # $( ((ko)) && echo '한국어 화면으로 실행(저장됨)' || echo 'run in Korean (saved)' )
+rpm -q --changelog safetui | less   # $( ((ko)) && echo '버전별 변경 내용' || echo 'changes by version' )
 EOF
 }
 
@@ -2317,7 +2317,7 @@ lang_menu() {
         ko) LANG_MODE="ko"; save_lang ;;
         en) LANG_MODE="en"; save_lang ;;
     esac
-    BACKTITLE="secpanel ${APP_VERSION} — $(L '방화벽·SELinux·작업 안전장치·백업' 'Firewall·SELinux·Guard·Backup')"
+    BACKTITLE="safetui ${APP_VERSION} — $(L '방화벽·SELinux·작업 안전장치·백업' 'Firewall·SELinux·Guard·Backup')"
 }
 
 # ---------------------------------------------------------------------------
@@ -2343,7 +2343,7 @@ main_menu() {
             # If the cursor was put on <Quit> by ESC, ask once more. In that state, choosing an item with the
             # arrow keys and pressing Enter activates <Quit>, not the item (prevents quitting by accident)
             if [[ "$defbtn" == cancel ]]; then
-                yesno "$(L '종료' 'Quit')" "$(L 'secpanel 을 종료할까요?' 'Quit secpanel?')" 7 50 || { defbtn=ok; continue; }
+                yesno "$(L '종료' 'Quit')" "$(L 'safetui 를 종료할까요?' 'Quit safetui?')" 7 50 || { defbtn=ok; continue; }
             fi
             break
         fi
@@ -2351,8 +2351,8 @@ main_menu() {
             if (( rc == DIALOG_ESC || GOT_INT )); then GOT_INT=0; fails=0; defbtn=cancel; continue; fi
             # Any other code means the screen could not be drawn (terminal too small etc.). Do not loop forever; explain and exit
             if (( ++fails >= 3 )); then
-                EXIT_NOTE="$(L 'secpanel: 화면을 표시할 수 없어 종료했습니다. 터미널 창을 80x24 이상으로 키운 뒤 다시 실행하세요.' \
-                               'secpanel: could not draw the screen and exited. Enlarge the terminal to at least 80x24 and run again.') (stty size: $(stty size 2>/dev/null))"
+                EXIT_NOTE="$(L 'safetui: 화면을 표시할 수 없어 종료했습니다. 터미널 창을 80x24 이상으로 키운 뒤 다시 실행하세요.' \
+                               'safetui: could not draw the screen and exited. Enlarge the terminal to at least 80x24 and run again.') (stty size: $(stty size 2>/dev/null))"
                 break
             fi
             sleep 0.3; continue
@@ -2389,13 +2389,13 @@ Usage:
   sudo ${APP_NAME} --db-backup  run the MariaDB backup once, no menu (used by the schedule)
   ${APP_NAME} --help          this help
 
-Language can also be set via SECPANEL_LANG=en|ko, or the in-app Language menu.
+Language can also be set via SAFETUI_LANG=en|ko, or the in-app Language menu.
 Target: RHEL / Rocky / AlmaLinux 9. Requires root.
 EOF
         exit 0 ;;
 esac
 
-BACKTITLE="secpanel ${APP_VERSION} — $(L '방화벽·SELinux·작업 안전장치·백업' 'Firewall·SELinux·Guard·Backup')"
+BACKTITLE="safetui ${APP_VERSION} — $(L '방화벽·SELinux·작업 안전장치·백업' 'Firewall·SELinux·Guard·Backup')"
 need_root
 preflight
 guard_ticker </dev/null >/dev/null 2>&1 &

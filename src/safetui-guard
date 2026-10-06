@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# secpanel-guard — remote lockout guard (dead-man auto-rollback)
+# safetui-guard — remote lockout guard (dead-man auto-rollback)
 #                  (dead-man switch with automatic rollback)
 #
 # Before a change that could cut your own connection (firewall / network / sshd),
@@ -8,47 +8,47 @@
 # limit, systemd restores the snapshot. The timer is held by systemd (PID 1), so
 # the rollback runs even if the SSH session dies.
 #
-# Language: SECPANEL_LANG=en|ko or /etc/secpanel/lang
+# Language: SAFETUI_LANG=en|ko or /etc/safetui/lang
 #
 set -uo pipefail
 
-SNAP_ROOT="/var/lib/secpanel-guard"
+SNAP_ROOT="/var/lib/safetui-guard"
 ACTIVE="$SNAP_ROOT/active"
-UNIT="secpanel-guard"          # name of the transient systemd-run unit
-WARN_UNIT="secpanel-guard-warn" # unit for the reminders before a rollback
+UNIT="safetui-guard"          # name of the transient systemd-run unit
+WARN_UNIT="safetui-guard-warn" # unit for the reminders before a rollback
 WARN_BEFORE=60                  # how many seconds before the rollback to start reminding
 WARN_EVERY=10                   # seconds between reminders
-GLOG="/var/log/secpanel-guard.log"   # arm / confirm / rollback history (root only)
+GLOG="/var/log/safetui-guard.log"   # arm / confirm / rollback history (root only)
 DEFAULT_TIMEOUT=300
 
 # --- language (i18n) ---
-LANG_FILE="/etc/secpanel/lang"
-# Priority: SECPANEL_LANG > /etc/secpanel/lang > package default (UI_LANG) > English
+LANG_FILE="/etc/safetui/lang"
+# Priority: SAFETUI_LANG > /etc/safetui/lang > package default (UI_LANG) > English
 GLANG="en"
-_gl="${SECPANEL_LANG:-}"
+_gl="${SAFETUI_LANG:-}"
 [[ -z "$_gl" && -r "$LANG_FILE" ]] && _gl="$(cat "$LANG_FILE" 2>/dev/null)"
-[[ -z "$_gl" && -r /usr/share/secpanel/defaults.conf ]] && \
-    _gl="$(sed -n 's/^UI_LANG=//p' /usr/share/secpanel/defaults.conf 2>/dev/null | head -n 1)"
+[[ -z "$_gl" && -r /usr/share/safetui/defaults.conf ]] && \
+    _gl="$(sed -n 's/^UI_LANG=//p' /usr/share/safetui/defaults.conf 2>/dev/null | head -n 1)"
 case "$_gl" in ko|KO|korean) GLANG="ko" ;; *) GLANG="en" ;; esac
 L() { if [[ "$GLANG" == "en" ]]; then printf '%s' "$2"; else printf '%s' "$1"; fi; }
 
-need_root() { [[ $EUID -eq 0 ]] || { echo "$(L 'root 권한 필요' 'root required'): sudo secpanel-guard $*"; exit 1; }; }
+need_root() { [[ $EUID -eq 0 ]] || { echo "$(L 'root 권한 필요' 'root required'): sudo safetui-guard $*"; exit 1; }; }
 # Log through logger only when interactive (terminal). Under systemd, stdout already goes
-# to the journal (SYSLOG_IDENTIFIER=secpanel-guard), so this avoids duplicate entries.
-log() { echo "$*"; if [[ -t 1 ]]; then logger -t secpanel-guard "$*" 2>/dev/null; fi; return 0; }
+# to the journal (SYSLOG_IDENTIFIER=safetui-guard), so this avoids duplicate entries.
+log() { echo "$*"; if [[ -t 1 ]]; then logger -t safetui-guard "$*" 2>/dev/null; fi; return 0; }
 
 # Append one line to the history file (so you can see later when it was armed, confirmed or rolled back)
 hist() { ( umask 077; printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$GLOG" ) 2>/dev/null; return 0; }
 who_ran() { echo "${SUDO_USER:-$(id -un 2>/dev/null)}"; }
 
-# One-line notice to logged-in terminals. Terminals showing the secpanel menu are skipped
-# (secpanel shows the remaining time on its top line there, so the text does not overlap the screen).
+# One-line notice to logged-in terminals. Terminals showing the safetui menu are skipped
+# (safetui shows the remaining time on its top line there, so the text does not overlap the screen).
 notify() {
     local msg="$1" line dev
     while read -r line; do
         dev="/dev/$line"
         [[ -c "$dev" ]] || continue
-        ps -t "$line" -o args= 2>/dev/null | grep -Eq '(^|[ /])secpanel( |$)' && continue
+        ps -t "$line" -o args= 2>/dev/null | grep -Eq '(^|[ /])safetui( |$)' && continue
         timeout 2 sh -c 'printf "\r\n%s\r\n" "$1" > "$2"' _ "$msg" "$dev" 2>/dev/null
     done < <(who 2>/dev/null | awk '{print $2}' | sort -u)
     return 0
@@ -141,7 +141,7 @@ do_rollback() {
 
     log "$(L '=== 롤백 완료 ===' '=== rollback done ===')"
 
-    # Record that a rollback happened: marker file (for the secpanel screen) + history file + journal + terminal notice
+    # Record that a rollback happened: marker file (for the safetui screen) + history file + journal + terminal notice
     date +%s > "$dir/rolled_back" 2>/dev/null
     done_at="$(date '+%H:%M:%S')"
     if [[ "$mode" == auto ]]; then
@@ -149,8 +149,8 @@ do_rollback() {
                   "AUTO-ROLLBACK [${targets}] not confirmed in time, reverted to the ${armed:-?} state")"
         log "$(L "자동 원복 완료: 확정하지 않아 [${targets}] 설정을 안전장치를 켠 시점(${armed:-?})으로 되돌렸습니다." \
                  "auto-rollback done: [${targets}] reverted to the state at arm time (${armed:-?}) because it was not confirmed.")"
-        notify "[secpanel-guard] $(L "${done_at} 자동 원복 완료 — 확정하지 않아 [${targets}] 설정을 안전장치를 켠 시점(${armed:-?})으로 되돌렸습니다. 기록: sudo secpanel-guard log" \
-                                     "${done_at} auto-rollback done — [${targets}] reverted to the state at arm time (${armed:-?}). History: sudo secpanel-guard log")"
+        notify "[safetui-guard] $(L "${done_at} 자동 원복 완료 — 확정하지 않아 [${targets}] 설정을 안전장치를 켠 시점(${armed:-?})으로 되돌렸습니다. 기록: sudo safetui-guard log" \
+                                     "${done_at} auto-rollback done — [${targets}] reverted to the state at arm time (${armed:-?}). History: sudo safetui-guard log")"
     else
         hist "$(L "수동 원복   [${targets}] $(who_ran) 가 즉시 롤백 실행, ${armed:-?} 상태로 되돌림" \
                   "MANUAL-ROLLBACK [${targets}] by $(who_ran), reverted to the ${armed:-?} state")"
@@ -160,15 +160,15 @@ do_rollback() {
 }
 
 # From WARN_BEFORE seconds before the rollback, every WARN_EVERY seconds, show a one-line notice on logged-in terminals.
-# (Terminals showing the secpanel menu are skipped. Nothing happens if nobody is logged in; a failed notice does not affect the rollback)
+# (Terminals showing the safetui menu are skipped. Nothing happens if nobody is logged in; a failed notice does not affect the rollback)
 do_warn() {
     local at to left msg
     while timer_active && [[ -f "$ACTIVE/armed_at" && -f "$ACTIVE/timeout" && ! -f "$ACTIVE/confirmed" ]]; do
         at="$(cat "$ACTIVE/armed_at")"; to="$(cat "$ACTIVE/timeout")"
         left=$(( at + to - $(date +%s) ))
         (( left <= 2 )) && break
-        msg="[secpanel-guard] $(L "${left}초 뒤 [$(cat "$ACTIVE/targets" 2>/dev/null)] 설정을 자동으로 되돌립니다. 변경을 유지하려면:  sudo secpanel-guard ok" \
-                                  "Auto-rollback of [$(cat "$ACTIVE/targets" 2>/dev/null)] in ${left}s. To keep your changes:  sudo secpanel-guard ok")"
+        msg="[safetui-guard] $(L "${left}초 뒤 [$(cat "$ACTIVE/targets" 2>/dev/null)] 설정을 자동으로 되돌립니다. 변경을 유지하려면:  sudo safetui-guard ok" \
+                                  "Auto-rollback of [$(cat "$ACTIVE/targets" 2>/dev/null)] in ${left}s. To keep your changes:  sudo safetui-guard ok")"
         echo "$msg"
         notify "$msg"
         (( left <= WARN_EVERY )) && break
@@ -197,8 +197,8 @@ cmd_arm() {
         esac
     done
     if timer_active; then
-        echo "$(L "이미 가드가 걸려 있습니다. 먼저 'secpanel-guard ok' 로 확정하거나 rollback 하세요." \
-                 "A guard is already armed. Confirm with 'secpanel-guard ok' or roll back first.")"
+        echo "$(L "이미 가드가 걸려 있습니다. 먼저 'safetui-guard ok' 로 확정하거나 rollback 하세요." \
+                 "A guard is already armed. Confirm with 'safetui-guard ok' or roll back first.")"
         cmd_status; return 1
     fi
 
@@ -215,8 +215,8 @@ cmd_arm() {
     # transient systemd-run timer (PID 1 runs it even if the session dies). The language is passed along.
     local runerr
     runerr="$(systemd-run --unit="$UNIT" --on-active="${timeout}" --timer-property=AccuracySec=1s \
-        --setenv=SECPANEL_LANG="$GLANG" \
-        --collect /usr/bin/secpanel-guard __rollback "$ACTIVE" 2>&1)"
+        --setenv=SAFETUI_LANG="$GLANG" \
+        --collect /usr/bin/safetui-guard __rollback "$ACTIVE" 2>&1)"
     local rc=$?
     if [[ $rc -ne 0 ]] || ! timer_active; then
         rm -rf "$ACTIVE"
@@ -224,13 +224,13 @@ cmd_arm() {
             cat <<EOF
 !!!! GUARD ARM FAILED — auto-rollback was NOT scheduled !!!!
      Do NOT proceed with risky changes. (cause: ${runerr:-unknown})
-     Check 'sudo secpanel-guard status'.
+     Check 'sudo safetui-guard status'.
 EOF
         else
             cat <<EOF
 !!!! 안전장치 설정 실패 — 자동 롤백이 예약되지 않았습니다 !!!!
      위험 작업을 진행하지 마세요. (원인: ${runerr:-unknown})
-     'sudo secpanel-guard status' 로 상태를 확인하세요.
+     'sudo safetui-guard status' 로 상태를 확인하세요.
 EOF
         fi
         return 1
@@ -240,7 +240,7 @@ EOF
     local warn_in=$(( timeout - WARN_BEFORE ))
     (( warn_in < 1 )) && warn_in=1
     systemd-run --unit="$WARN_UNIT" --on-active="${warn_in}" --timer-property=AccuracySec=1s \
-        --setenv=SECPANEL_LANG="$GLANG" --collect /usr/bin/secpanel-guard __warn >/dev/null 2>&1
+        --setenv=SAFETUI_LANG="$GLANG" --collect /usr/bin/safetui-guard __warn >/dev/null 2>&1
 
     log "$(L "가드 ARM: ${timeout}초 후 자동 롤백 예약" "guard ARM: auto-rollback in ${timeout}s") ($(L '대상' 'targets'): $targets, note: ${note:-none})"
     hist "$(L "안전장치 켬 [${targets}] $(who_ran), ${timeout}초 뒤 자동 원복 예약${note:+, 메모: $note}" \
@@ -252,10 +252,10 @@ EOF
    GUARD ON — verify your access within ${timeout}s.
      targets: $targets
 
-     access OK   ->  sudo secpanel-guard ok      (cancel auto-rollback)
+     access OK   ->  sudo safetui-guard ok      (cancel auto-rollback)
      locked out  ->  auto-revert [$targets] after ${timeout}s
      A reminder is shown on logged-in terminals every ${WARN_EVERY}s
-     during the last ${WARN_BEFORE}s (inside secpanel: top-right of the screen).
+     during the last ${WARN_BEFORE}s (inside safetui: top-right of the screen).
   ================================================================
 EOF
     else
@@ -265,10 +265,10 @@ EOF
    안전장치 ON — ${timeout}초 안에 접속이 살아있는지 확인하세요.
      대상: $targets
 
-     접속 정상  ->  sudo secpanel-guard ok      (자동 롤백 취소)
+     접속 정상  ->  sudo safetui-guard ok      (자동 롤백 취소)
      락아웃됨   ->  ${timeout}초 뒤 [$targets] 자동 원복
      되돌리기 ${WARN_BEFORE}초 전부터 ${WARN_EVERY}초마다, 접속해 있는 터미널에 알림이 뜹니다.
-     (secpanel 화면에서는 맨 위 오른쪽에 남은 시간이 표시됩니다)
+     (safetui 화면에서는 맨 위 오른쪽에 남은 시간이 표시됩니다)
   ================================================================
 EOF
     fi
@@ -297,8 +297,8 @@ cmd_status() {
         [[ -f "$ACTIVE/targets" ]] && echo "$(L '대상' 'targets'): $(cat "$ACTIVE/targets")"
         [[ -s "$ACTIVE/note" ]] && echo "$(L '메모' 'note'): $(cat "$ACTIVE/note")"
         echo
-        echo "$(L '접속이 정상이면 확정' 'access OK -> confirm'):  sudo secpanel-guard ok"
-        echo "$(L '지금 바로 되돌리기' 'roll back now'):      sudo secpanel-guard rollback"
+        echo "$(L '접속이 정상이면 확정' 'access OK -> confirm'):  sudo safetui-guard ok"
+        echo "$(L '지금 바로 되돌리기' 'roll back now'):      sudo safetui-guard rollback"
     else
         echo "$(L '가드 상태: 없음 (안전장치 꺼짐)' 'Guard: none (off)')"
         [[ -s "$GLOG" ]] && echo "$(L '마지막 기록' 'last event'): $(tail -n 1 "$GLOG")"
@@ -322,41 +322,41 @@ cmd_log() {
 usage() {
     if [[ "$GLANG" == "en" ]]; then
         cat <<EOF
-secpanel-guard — remote lockout guard (dead-man auto-rollback)
+safetui-guard — remote lockout guard (dead-man auto-rollback)
 
-  sudo secpanel-guard arm [--timeout SEC] [--note "text"] [--targets LIST]
+  sudo safetui-guard arm [--timeout SEC] [--note "text"] [--targets LIST]
        snapshot + schedule auto-rollback before risky changes
        --targets: comma of firewall,sshd,network (default: all)
                   e.g. --targets firewall,sshd
-  sudo secpanel-guard ok         access confirmed -> cancel auto-rollback
-  sudo secpanel-guard status     show current guard status
-  sudo secpanel-guard rollback   roll back to the snapshot now
-  sudo secpanel-guard log [N]    show history (arm / confirm / rollback), last N lines
+  sudo safetui-guard ok         access confirmed -> cancel auto-rollback
+  sudo safetui-guard status     show current guard status
+  sudo safetui-guard rollback   roll back to the snapshot now
+  sudo safetui-guard log [N]    show history (arm / confirm / rollback), last N lines
 
 e.g. before changing firewall rules:
-  sudo secpanel-guard arm --timeout 120 --note "port change"
-  # ...edit firewall via secpanel...
+  sudo safetui-guard arm --timeout 120 --note "port change"
+  # ...edit firewall via safetui...
   # if you still have access:
-  sudo secpanel-guard ok
+  sudo safetui-guard ok
 EOF
     else
         cat <<EOF
-secpanel-guard — 원격 락아웃 방지 (dead-man 자동 롤백)
+safetui-guard — 원격 락아웃 방지 (dead-man 자동 롤백)
 
-  sudo secpanel-guard arm [--timeout 초] [--note "설명"] [--targets 목록]
+  sudo safetui-guard arm [--timeout 초] [--note "설명"] [--targets 목록]
        위험 작업 전 스냅샷 + 자동 롤백 타이머
        --targets: firewall,sshd,network 중 콤마로 선택 (기본 all)
                   예) --targets firewall,sshd
-  sudo secpanel-guard ok         접속 정상 확인 -> 자동 롤백 취소(확정)
-  sudo secpanel-guard status     현재 가드 상태
-  sudo secpanel-guard rollback   지금 즉시 수동 롤백
-  sudo secpanel-guard log [N]    켬·확정·원복 기록 보기 (최근 N줄, 기본 50)
+  sudo safetui-guard ok         접속 정상 확인 -> 자동 롤백 취소(확정)
+  sudo safetui-guard status     현재 가드 상태
+  sudo safetui-guard rollback   지금 즉시 수동 롤백
+  sudo safetui-guard log [N]    켬·확정·원복 기록 보기 (최근 N줄, 기본 50)
 
 예) 방화벽 규칙 바꾸기 전:
-  sudo secpanel-guard arm --timeout 120 --note "포트정책 변경"
-  # ...secpanel 로 방화벽 수정...
+  sudo safetui-guard arm --timeout 120 --note "포트정책 변경"
+  # ...safetui 로 방화벽 수정...
   # 접속 여전히 되면:
-  sudo secpanel-guard ok
+  sudo safetui-guard ok
 EOF
     fi
 }

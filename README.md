@@ -1,25 +1,25 @@
-# secpanel
+# safetui
 
 A terminal menu (TUI) for everyday server work on RHEL / Rocky Linux / AlmaLinux 9:
 **firewall, SELinux, a lockout guard with automatic rollback, and backups** — all from
 one screen, without having to remember the commands.
 
-- Target: **RHEL / Rocky Linux / AlmaLinux 9**, run as root (`sudo secpanel`)
+- Target: **RHEL / Rocky Linux / AlmaLinux 9**, run as root (`sudo safetui`)
 - Languages: **English** (default) and **Korean** — switch from the main menu, or
-  `secpanel --english` / `secpanel --korean`
+  `safetui --english` / `safetui --korean`
 - Pure shell scripts on top of `dialog` / `whiptail`. No daemon, no open port.
 
 ## Download
 
-**[Download the latest RPM](https://github.com/KTdisbandplease/secpanel/releases/latest/download/secpanel-latest.el9.noarch.rpm)**
+**[Download the latest RPM](https://github.com/KTdisbandplease/safetui/releases/latest/download/safetui-latest.el9.noarch.rpm)**
 (RHEL / Rocky Linux / AlmaLinux 9, noarch) — or install it straight from the URL:
 
 ```bash
-sudo dnf install -y https://github.com/KTdisbandplease/secpanel/releases/latest/download/secpanel-latest.el9.noarch.rpm
-sudo secpanel
+sudo dnf install -y https://github.com/KTdisbandplease/safetui/releases/latest/download/safetui-latest.el9.noarch.rpm
+sudo safetui
 ```
 
-All versions are on the [Releases](https://github.com/KTdisbandplease/secpanel/releases) page.
+All versions are on the [Releases](https://github.com/KTdisbandplease/safetui/releases) page.
 
 ## Features
 
@@ -38,15 +38,15 @@ All versions are on the [Releases](https://github.com/KTdisbandplease/secpanel/r
   see a preview, so unrelated denials are not allowed by accident
 - Remove policy modules (only the ones you installed are listed)
 
-### Lockout guard (`secpanel-guard`)
+### Lockout guard (`safetui-guard`)
 A dead-man switch for risky remote changes.
 - Snapshots firewall / sshd / network settings and schedules an automatic rollback
 - If you do not confirm within the time limit, **systemd reverts the change — even if your
   SSH session is gone**
-- Remaining time is shown at the top right of the secpanel screen; other logged-in
+- Remaining time is shown at the top right of the safetui screen; other logged-in
   terminals get a one-line reminder every 10 seconds during the last minute
 - After a rollback you are told so, and every arm / confirm / rollback is recorded in
-  `/var/log/secpanel-guard.log` (`secpanel-guard log`)
+  `/var/log/safetui-guard.log` (`safetui-guard log`)
 
 ### Backup
 - **Files and folders**: pick them in a file browser (arrow keys, Space to select, Enter to
@@ -55,7 +55,7 @@ A dead-man switch for risky remote changes.
 - **MariaDB**: dump without stopping the service (`--single-transaction`, low CPU / IO
   priority), optional gzip, old dumps removed after a retention period
 - **Scheduled DB backup**: daily / weekly / monthly (a day or the last day) at a set time.
-  This is a systemd timer that runs `secpanel --db-backup` once — secpanel does not stay
+  This is a systemd timer that runs `safetui --db-backup` once — safetui does not stay
   running in the background.
 - History of file backups, list of DB dumps
 
@@ -66,14 +66,14 @@ Build the RPM yourself on RHEL / Rocky / AlmaLinux 9:
 ```bash
 sudo dnf install -y rpm-build rpmdevtools
 ./build-rpm.sh
-sudo dnf install ~/rpmbuild/RPMS/noarch/secpanel-*.noarch.rpm
+sudo dnf install ~/rpmbuild/RPMS/noarch/safetui-*.noarch.rpm
 ```
 
 Or run it without packaging:
 
 ```bash
-sudo install -m 0755 src/secpanel /usr/bin/secpanel
-sudo install -m 0755 src/secpanel-guard /usr/bin/secpanel-guard
+sudo install -m 0755 src/safetui /usr/bin/safetui
+sudo install -m 0755 src/safetui-guard /usr/bin/safetui-guard
 ```
 
 (Both must be in `/usr/bin`: the rollback timer and the backup schedule call them by that path.)
@@ -81,7 +81,7 @@ sudo install -m 0755 src/secpanel-guard /usr/bin/secpanel-guard
 ## Usage
 
 ```bash
-sudo secpanel
+sudo safetui
 ```
 
 | Key | Action |
@@ -99,16 +99,16 @@ Main menu 6 (**About / Help**) has three pages: *About*, *Help* (keys and tips) 
 Command-line use:
 
 ```bash
-secpanel --version
-sudo secpanel --db-backup                 # run the configured DB backup once
-sudo secpanel-guard arm --timeout 300 --targets firewall --note "port change"
-sudo secpanel-guard ok                    # confirm, keep the change
-sudo secpanel-guard status                # also: rollback, log
+safetui --version
+sudo safetui --db-backup                 # run the configured DB backup once
+sudo safetui-guard arm --timeout 300 --targets firewall --note "port change"
+sudo safetui-guard ok                    # confirm, keep the change
+sudo safetui-guard status                # also: rollback, log
 ```
 
 ## Backup settings
 
-Stored in `/etc/secpanel/backup.conf` (root only, mode 600). Change them from
+Stored in `/etc/safetui/backup.conf` (root only, mode 600). Change them from
 **Backup > Backup settings**.
 
 | Setting | Default | Notes |
@@ -128,10 +128,10 @@ Stored in `/etc/secpanel/backup.conf` (root only, mode 600). Change them from
 place to keep backups: on RHEL 9 files in `/tmp` are deleted automatically after about
 10 days, and they share a disk with everything else. Point the backup folders at a
 dedicated location before relying on them. Because `/tmp` is writable by every user,
-secpanel refuses to write a backup under it if any folder on the path was created by
+safetui refuses to write a backup under it if any folder on the path was created by
 another account or is a symbolic link.
 
-A packager can ship different defaults in `/usr/share/secpanel/defaults.conf`
+A packager can ship different defaults in `/usr/share/safetui/defaults.conf`
 (same `KEY=value` format as `backup.conf`, plus `UI_LANG=en|ko`).
 
 ## Security notes
@@ -140,7 +140,7 @@ A packager can ship different defaults in `/usr/share/secpanel/defaults.conf`
 - User input is passed to commands as arguments, never through `eval`.
 - The DB password is stored in a root-only file and handed to `mariadb-dump` through a
   temporary root-only options file, not on the command line.
-- Dump files are created with mode 600; a backup folder created by secpanel is mode 700.
+- Dump files are created with mode 600; a backup folder created by safetui is mode 700.
 - Temporary files live in a private directory created with `mktemp -d`.
 
 ## Dependencies
@@ -155,9 +155,9 @@ and shows a warning if there is none.
 
 ## License and third-party software
 
-secpanel itself is released under the **MIT License** — see [LICENSE](LICENSE).
+safetui itself is released under the **MIT License** — see [LICENSE](LICENSE).
 
-secpanel does not include or link any third-party code. It runs the following system tools
+safetui does not include or link any third-party code. It runs the following system tools
 as separate programs; each stays under its own license:
 
 | Tool (package) | License | Used for |
