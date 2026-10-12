@@ -58,6 +58,40 @@ timer_active() { systemctl is-active --quiet "${UNIT}.timer" 2>/dev/null; }
 has_target() { [[ ",$1," == *",$2,"* || ",$1," == *",all,"* ]]; }
 
 # --------------------------------------------------------------------------
+# Remember whether a service was running / enabled when the guard was armed,
+# so a rollback can bring it back if it was stopped, disabled or masked meanwhile.
+svc_record() {
+    local svc="$1"
+    systemctl is-active --quiet "$svc" 2>/dev/null && echo yes > "$ACTIVE/$svc.active"
+    systemctl is-enabled "$svc" 2>/dev/null | head -n 1 > "$ACTIVE/$svc.enabled"
+    return 0
+}
+
+# svc_revive <snapshot dir> <service>
+# Only ever brings a service back. A service that was already stopped at arm time is left alone.
+svc_revive() {
+    local dir="$1" svc="$2" was now
+    was="$(cat "$dir/$svc.enabled" 2>/dev/null)"
+    now="$(systemctl is-enabled "$svc" 2>/dev/null | head -n 1)"
+    if [[ -n "$was" && "$was" != masked* && "$now" == masked* ]]; then
+        systemctl unmask "$svc" >/dev/null 2>&1 && log "$(L "$svc 차단(mask) 해제" "$svc unmasked")"
+        now="$(systemctl is-enabled "$svc" 2>/dev/null | head -n 1)"
+    fi
+    if [[ "$was" == enabled* && "$now" != enabled* ]]; then
+        systemctl enable "$svc" >/dev/null 2>&1 && log "$(L "$svc 자동 시작 다시 켬(enable)" "$svc enabled again")"
+    fi
+    if [[ -f "$dir/$svc.active" ]] && ! systemctl is-active --quiet "$svc" 2>/dev/null; then
+        if systemctl start "$svc" >/dev/null 2>&1; then
+            log "$(L "$svc 가 꺼져 있어 다시 시작함" "$svc was stopped — started again")"
+            echo "$svc" >> "$dir/revived"
+        else
+            log "$(L "경고: $svc 를 다시 시작하지 못함 — 'systemctl status $svc' 확인" "warning: could not start $svc — check 'systemctl status $svc'")"
+        fi
+    fi
+    return 0
+}
+
+# --------------------------------------------------------------------------
 # snapshot <targets-csv>
 snapshot() {
     local targets="${1:-all}"
@@ -65,17 +99,19 @@ snapshot() {
     echo "$targets" > "$ACTIVE/targets"
 
     if has_target "$targets" firewall; then
-        if systemctl is-active --quiet firewalld 2>/dev/null; then
+        svc_record firewalld
+        if [[ -f "$ACTIVE/firewalld.active" ]]; then
             cp -a /etc/firewalld "$ACTIVE/firewalld" 2>/dev/null
-            echo yes > "$ACTIVE/firewalld.active"
         fi
         command -v nft >/dev/null 2>&1 && nft list ruleset > "$ACTIVE/ruleset.nft" 2>/dev/null
     fi
     if has_target "$targets" sshd; then
+        svc_record sshd
         [[ -f /etc/ssh/sshd_config ]] && cp -a /etc/ssh/sshd_config "$ACTIVE/sshd_config"
         [[ -d /etc/ssh/sshd_config.d ]] && cp -a /etc/ssh/sshd_config.d "$ACTIVE/sshd_config.d"
     fi
     if has_target "$targets" network; then
+        svc_record NetworkManager
         [[ -d /etc/NetworkManager/system-connections ]] && \
             cp -a /etc/NetworkManager/system-connections "$ACTIVE/nm-connections"
     fi
@@ -100,10 +136,14 @@ do_rollback() {
             log "$(L '경고: 복구된 sshd_config 검증 실패 — 재시작 생략' 'warning: restored sshd_config failed validation — skip restart')"
         fi
     fi
+    # sshd was running at arm time but has been stopped / disabled since -> bring it back
+    has_target "$targets" sshd && svc_revive "$dir" sshd
 
     # restore the firewall
     if [[ -d "$dir/firewalld" && -f "$dir/firewalld.active" ]]; then
         rm -rf /etc/firewalld; cp -a "$dir/firewalld" /etc/firewalld
+        # firewalld was running at arm time: start it again first if it was stopped / disabled / masked
+        svc_revive "$dir" firewalld
         firewall-cmd --complete-reload 2>/dev/null && log "$(L 'firewalld 영구설정 복구 + reload' 'firewalld permanent config restored + reload')"
     elif [[ -f "$dir/ruleset.nft" ]]; then
         nft -f "$dir/ruleset.nft" 2>/dev/null && log "$(L 'nftables 룰셋 복구' 'nftables ruleset restored')"
@@ -113,6 +153,7 @@ do_rollback() {
     if [[ -d "$dir/nm-connections" ]]; then
         rm -rf /etc/NetworkManager/system-connections
         cp -a "$dir/nm-connections" /etc/NetworkManager/system-connections
+        svc_revive "$dir" NetworkManager
         command -v restorecon >/dev/null 2>&1 && \
             restorecon -R /etc/NetworkManager/system-connections 2>/dev/null
         nmcli connection reload 2>/dev/null
@@ -144,6 +185,9 @@ do_rollback() {
     # Record that a rollback happened: marker file (for the safetui screen) + history file + journal + terminal notice
     date +%s > "$dir/rolled_back" 2>/dev/null
     done_at="$(date '+%H:%M:%S')"
+    local revived=""
+    [[ -s "$dir/revived" ]] && revived="$(paste -sd, "$dir/revived" 2>/dev/null)"
+    [[ -n "$revived" ]] && hist "$(L "서비스 복구 [${revived}] 꺼져 있던 서비스를 다시 시작함" "SERVICE-RESTORED [${revived}] started again because it was stopped")"
     if [[ "$mode" == auto ]]; then
         hist "$(L "자동 원복   [${targets}] 시간 안에 확정하지 않아 ${armed:-?} 상태로 되돌림" \
                   "AUTO-ROLLBACK [${targets}] not confirmed in time, reverted to the ${armed:-?} state")"
@@ -254,6 +298,7 @@ EOF
 
      access OK   ->  sudo safetui-guard ok      (cancel auto-rollback)
      locked out  ->  auto-revert [$targets] after ${timeout}s
+                     (a stopped firewalld / sshd / NetworkManager is started again)
      A reminder is shown on logged-in terminals every ${WARN_EVERY}s
      during the last ${WARN_BEFORE}s (inside safetui: top-right of the screen).
   ================================================================
@@ -267,6 +312,7 @@ EOF
 
      접속 정상  ->  sudo safetui-guard ok      (자동 롤백 취소)
      락아웃됨   ->  ${timeout}초 뒤 [$targets] 자동 원복
+                    (꺼진 firewalld·sshd·NetworkManager 도 다시 시작)
      되돌리기 ${WARN_BEFORE}초 전부터 ${WARN_EVERY}초마다, 접속해 있는 터미널에 알림이 뜹니다.
      (safetui 화면에서는 맨 위 오른쪽에 남은 시간이 표시됩니다)
   ================================================================

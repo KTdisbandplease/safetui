@@ -43,6 +43,9 @@ A dead-man switch for risky remote changes.
 - Snapshots firewall / sshd / network settings and schedules an automatic rollback
 - If you do not confirm within the time limit, **systemd reverts the change — even if your
   SSH session is gone**
+- A rollback also brings services back: if firewalld, sshd or NetworkManager was running
+  when the guard was armed and has been stopped, disabled or masked since, it is
+  unmasked, enabled and started again
 - Remaining time is shown at the top right of the safetui screen; other logged-in
   terminals get a one-line reminder every 10 seconds during the last minute
 - After a rollback you are told so, and every arm / confirm / rollback is recorded in

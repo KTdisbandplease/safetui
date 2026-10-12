@@ -11,7 +11,7 @@
 set -o pipefail
 
 APP_NAME="safetui"
-APP_VERSION="3.0.0"
+APP_VERSION="3.1.0"
 
 # ---------------------------------------------------------------------------
 # Language (i18n)
@@ -2024,6 +2024,7 @@ backup in one place. You only pick from menus - no commands to remember.
 
 [ 3 Lockout guard ]
   - Snapshot firewall / sshd / network before a risky change
+  - A rollback also restarts firewalld / sshd if it was stopped
   - If you do not confirm in time, it reverts automatically -
     even if your SSH session is gone
   - Remaining time is shown at the top right; history is kept
@@ -2063,6 +2064,7 @@ safetui ${APP_VERSION}
   - 방화벽·sshd·네트워크를 바꾸기 전에 지금 상태를 저장
   - 정한 시간 안에 '확정'하지 않으면 자동으로 원래대로 되돌림
     (내 SSH 접속이 끊겨도 되돌리기는 실행됩니다)
+  - 그 사이 꺼진 firewalld·sshd 서비스도 되돌릴 때 다시 시작
   - 남은 시간은 화면 맨 위 오른쪽에 표시, 켬·확정·원복 기록 보관
 
 [ 4 백업 ]
