@@ -11,7 +11,7 @@
 set -o pipefail
 
 APP_NAME="safetui"
-APP_VERSION="3.2.0"
+APP_VERSION="3.2.1"
 
 # ---------------------------------------------------------------------------
 # Language (i18n)
@@ -1191,10 +1191,12 @@ BK_DB_HOME="/usr"                         # MariaDB install path (bin/mariadb-du
 BK_DB_USER="root"
 BK_DB_PASS=""                             # empty = connect without a password
 BK_DB_NAME=""                             # empty = all databases
-BK_DB_DIR="/tmp/backup/db"                # where DB dumps are stored
+BK_DB_DIR="/var/backups/safetui/db"       # where DB dumps are stored
+                                          # (not under /tmp: systemd-tmpfiles deletes old files there,
+                                          #  and on a tmpfs /tmp the backups would vanish on reboot)
 BK_DB_KEEP_DAYS="30"                      # 0 = never delete
 BK_DEST_MODE="same"                       # same = next to the original, dir = BK_DEST_DIR
-BK_DEST_DIR="/tmp/backup/files"
+BK_DEST_DIR="/var/backups/safetui/files"
 BK_SUFFIX='_$today'                       # $today → YYYYMMDD, $time → HHMMSS
 BK_EXISTS="ask"                           # ask | number | overwrite | skip
 BK_DB_COMPRESS="yes"                      # yes = .sql.gz, no = .sql
@@ -1204,6 +1206,11 @@ BK_SCHED_DOW="Mon"                        # weekday for weekly (Mon..Sun)
 BK_SCHED_DOM="1"                          # day for monthly (1-28) or last (last day of the month)
 BK_SCHED_TIME="03:00"                     # time of day HH:MM
 BK_UNIT="safetui-dbbackup"               # systemd unit name of the scheduled backup
+
+# Allowed database names: letters, digits, _ - $, several separated by single spaces.
+# Keep it in a variable in single quotes: written straight into [[ =~ ]] the shell expands "$-"
+# (the shell option flags), which silently dropped the hyphen from the allowed characters.
+BK_DBNAME_RE='^[A-Za-z0-9_$-]+( [A-Za-z0-9_$-]+)*$'
 
 declare -A BK_SEL=()    # paths picked in the file browser (an empty value means unselected)
 declare -A BK_USED=()   # backup paths already created in this run
@@ -1223,7 +1230,8 @@ bk_load_file() {
             DB_HOME)      BK_DB_HOME="$v" ;;
             DB_USER)      BK_DB_USER="$v" ;;
             DB_PASS)      BK_DB_PASS="$v" ;;
-            DB_NAME)      BK_DB_NAME="$v" ;;
+            # 메뉴 입력과 같은 형식 검사. 설정 파일을 손으로 고쳤을 때 이상한 값이 그대로 쓰이지 않게.
+            DB_NAME)      [[ -z "$v" || "$v" =~ $BK_DBNAME_RE ]] && BK_DB_NAME="$v" ;;
             DB_DIR)       BK_DB_DIR="$v" ;;
             DB_KEEP_DAYS) [[ "$v" =~ ^[0-9]{1,4}$ ]] && BK_DB_KEEP_DAYS="$v" ;;
             DEST_MODE)    [[ "$v" == same || "$v" == dir ]] && BK_DEST_MODE="$v" ;;
@@ -1366,7 +1374,7 @@ bk_settings() {
                     "$(L '덤프할 DB 이름을 입력하세요. 여러 개는 공백으로 구분합니다.\n비워 두면 전체 DB 를 한 파일로 백업합니다.' \
                          'Enter database name(s), separated by spaces.\nLeave empty to dump all databases into one file.')" "$BK_DB_NAME")" || continue
                v="$(printf '%s' "$v" | xargs 2>/dev/null)"
-               if [[ -z "$v" || "$v" =~ ^[A-Za-z0-9_$-]+(\ [A-Za-z0-9_$-]+)*$ ]]; then BK_DB_NAME="$v"; bk_save
+               if [[ -z "$v" || "$v" =~ $BK_DBNAME_RE ]]; then BK_DB_NAME="$v"; bk_save
                else msg "$(L '입력 오류' 'Invalid input')" "$(L 'DB 이름은 영문/숫자/_/-/$ 만 쓸 수 있습니다.' 'Use only letters, digits, _, - and $.')" 8; fi ;;
             5) v="$(dlg_input "$(L 'DB 백업 저장 위치' 'DB backup folder')" \
                     "$(L 'DB 덤프 파일(.sql.gz)을 저장할 폴더를 입력하세요. 없으면 만듭니다.' 'Folder for dump files (.sql.gz). Created if missing.')" "$BK_DB_DIR")" || continue
@@ -1539,7 +1547,7 @@ bk_copy_one() {
         BK_MSG="$(L '실패' 'FAILED')  $src\n        $(L '저장 위치가 이 폴더 안에 있어 백업할 수 없습니다' 'the backup folder is inside this folder'): $destdir"
         return 1
     fi
-    if ! bk_dir_safe "$destdir" >"$TMP_DIR/cp.err" || ! mkdir -p -- "$destdir" 2>>"$TMP_DIR/cp.err" \
+    if ! bk_dir_safe "$destdir" >"$TMP_DIR/cp.err" || ! ( umask 077; mkdir -p -- "$destdir" ) 2>>"$TMP_DIR/cp.err" \
          || ! bk_dir_safe "$destdir" >"$TMP_DIR/cp.err"; then
         BK_MSG="$(L '실패' 'FAILED')  $src\n        $(head -n 1 "$TMP_DIR/cp.err")"; return 1
     fi
@@ -1619,7 +1627,7 @@ bk_tar_all() {
             return 1
         fi
     done
-    if ! bk_dir_safe "$destdir" >"$TMP_DIR/cp.err" || ! mkdir -p -- "$destdir" 2>>"$TMP_DIR/cp.err" \
+    if ! bk_dir_safe "$destdir" >"$TMP_DIR/cp.err" || ! ( umask 077; mkdir -p -- "$destdir" ) 2>>"$TMP_DIR/cp.err" \
          || ! bk_dir_safe "$destdir" >"$TMP_DIR/cp.err"; then
         BK_MSG="$(L '실패' 'FAILED')  $(L 'tar 묶음' 'tar bundle')\n        $(head -n 1 "$TMP_DIR/cp.err")"; return 1
     fi
@@ -1856,7 +1864,10 @@ bk_db_run() {
     if [[ -z "$BK_DB_NAME" ]]; then
         if bk_db_dump_one "all-databases" --all-databases; then BK_DB_MADE+=("$BK_LAST_FILE"); else ok=0; fi
     else
-        for db in $BK_DB_NAME; do
+        # read -a 로 나눈다 ($BK_DB_NAME 을 그대로 두면 * 같은 글자가 파일 이름으로 펼쳐짐)
+        local -a dbs=()
+        read -r -a dbs <<<"$BK_DB_NAME"
+        for db in "${dbs[@]}"; do
             if bk_db_dump_one "$db" "$db"; then BK_DB_MADE+=("$BK_LAST_FILE"); else ok=0; break; fi
         done
     fi
@@ -1958,6 +1969,21 @@ bk_sched_calendar() {
                  else printf '*-*-%02d %s:00\n' "$((10#$BK_SCHED_DOM))" "$BK_SCHED_TIME"; fi ;;
     esac
 }
+# Is this file safe to run from a systemd unit as root? (root-owned, not writable by group/others,
+# and every folder above it the same). Used for the ExecStart path of the schedule.
+bk_path_trusted() {
+    local p="$1" owner mode
+    [[ -n "$p" && -x "$p" && ! -L "$p" ]] || return 1
+    while :; do
+        owner="$(stat -c %u -- "$p" 2>/dev/null)" || return 1
+        mode="$(stat -c %a -- "$p" 2>/dev/null)"
+        [[ "$owner" == 0 ]] || return 1
+        (( 8#${mode:-0} & 8#0022 )) && return 1
+        [[ "$p" == "/" ]] && return 0
+        p="$(dirname "$p")"
+    done
+}
+
 # Apply the current BK_SCHED* settings to systemd (remove the units when off)
 bk_sched_apply() {
     local dir="/etc/systemd/system" cal self
@@ -1968,7 +1994,19 @@ bk_sched_apply() {
         systemctl daemon-reload >/dev/null 2>&1
         return 0
     fi
-    self="$(readlink -f "$0" 2>/dev/null)"; [[ -x "$self" ]] || self="/usr/bin/safetui"
+    # 예약은 root 로 실행되므로 ExecStart 에 아무 경로나 넣으면 안 된다.
+    # 설치본(/usr/bin/safetui)을 우선 쓰고, 없을 때만 지금 실행 중인 파일을 쓰되
+    # root 소유 + 남이 쓸 수 없는 경우에만 허용한다 (/tmp 등에서 복사해 돌린 파일이 박히는 것 방지).
+    self="/usr/bin/safetui"
+    if [[ ! -x "$self" ]]; then
+        self="$(readlink -f "$0" 2>/dev/null)"
+        if ! bk_path_trusted "$self"; then
+            echo "$(L '예약에 쓸 safetui 실행 파일을 찾지 못했습니다 (설치본이 아니거나, root 전용 경로가 아님)' \
+                     'No trusted safetui binary for the schedule (not the installed copy, or not a root-only path)')" >"$TMP_OUT"
+            echo "  $self" >>"$TMP_OUT"
+            return 1
+        fi
+    fi
     cat >"$dir/$BK_UNIT.service" <<EOF
 [Unit]
 Description=safetui scheduled MariaDB backup (safetui --db-backup)

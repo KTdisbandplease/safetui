@@ -1,5 +1,5 @@
 Name:           safetui
-Version:        3.2.0
+Version:        3.2.1
 Release:        1%{?dist}
 Summary:        Menu-driven firewall, SELinux, lockout guard and backup tool
 
@@ -79,6 +79,16 @@ fi
 %dir %attr(0700,root,root) %{_sharedstatedir}/safetui-guard
 
 %changelog
+* Thu Oct 15 2026 JJ <mrwhitehacker@naver.com> - 3.2.1-1
+- Backups now default to /var/backups/safetui instead of /tmp
+  (the OS deletes old files under /tmp, and on a tmpfs /tmp they are lost on reboot)
+- Backup folders are created root-only (700); file names no longer reveal
+  database names or the backup schedule to other accounts
+- The scheduled backup unit runs the installed /usr/bin/safetui; another path is
+  used only when it is root-owned and not writable by others
+- Database names read from backup.conf are checked the same way as menu input,
+  and are split without filename expansion
+
 * Thu Oct 15 2026 JJ <mrwhitehacker@naver.com> - 3.2.0-1
 - Firewall: add several ports at once, separated by commas
   (e.g. 3030,1234,10000-12000); nothing is added if one of them is invalid

@@ -132,20 +132,21 @@ Stored in `/etc/safetui/backup.conf` (root only, mode 600). Change them from
 | DB install path | `/usr` | `bin/mariadb-dump` under this path is used |
 | DB user / password | `root` / none | the password is optional |
 | Database name | all databases | several names separated by spaces |
-| DB backup folder | `/tmp/backup/db` | **change this** — see below |
+| DB backup folder | `/var/backups/safetui/db` | created root-only (700) |
 | DB backup retention | 30 days | 0 = keep forever |
 | DB backup gzip | on | off saves plain `.sql` |
-| File backup folder | same folder as the original | or one folder for everything (`/tmp/backup/files`) |
+| File backup folder | same folder as the original | or one folder for everything (`/var/backups/safetui/files`) |
 | Backup name suffix | `_$today` | `$today` = YYYYMMDD, `$time` = HHMMSS |
 | If it already exists | ask | add a number / overwrite / skip |
 | Bundle many into tar | off | |
 
-**About the default `/tmp/backup` location.** It works out of the box, but `/tmp` is not a
-place to keep backups: on RHEL 9 files in `/tmp` are deleted automatically after about
-10 days, and they share a disk with everything else. Point the backup folders at a
-dedicated location before relying on them. Because `/tmp` is writable by every user,
-safetui refuses to write a backup under it if any folder on the path was created by
-another account or is a symbolic link.
+**About the backup location.** Backups go to `/var/backups/safetui` by default, and the
+folders are created root-only (700) so that other accounts cannot even list which
+databases are backed up and how often. Keep backups off `/tmp`: on RHEL 9 files there are
+deleted automatically after about 10 days (sooner than the 30-day retention), and on a
+tmpfs `/tmp` they are lost on reboot. If you do point a backup folder under a
+world-writable place such as `/tmp`, safetui refuses to write when any folder on the path
+was created by another account or is a symbolic link.
 
 A packager can ship different defaults in `/usr/share/safetui/defaults.conf`
 (same `KEY=value` format as `backup.conf`, plus `UI_LANG=en|ko`).
