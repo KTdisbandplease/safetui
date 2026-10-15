@@ -11,7 +11,7 @@
 set -o pipefail
 
 APP_NAME="safetui"
-APP_VERSION="3.1.2"
+APP_VERSION="3.2.0"
 
 # ---------------------------------------------------------------------------
 # Language (i18n)
@@ -110,6 +110,49 @@ flush_input() {
 }
 
 # Wrapper that returns the dialog result on stdout. OK/Cancel/Back labels follow the language.
+# dialog 1.3 / whiptail do not re-centre a window when the terminal is resized while it is
+# shown (it stays where it was and gets cut off). Run them in the background and, on SIGWINCH,
+# close and reopen the same window at the new size. Progress / info boxes are run as they are.
+TUI_CHILD=""
+TUI_WINCH=0
+# A LINES / COLUMNS left in the environment (some terminals and wrappers export them) would make
+# dialog draw for that old size instead of asking the terminal. Always use the real size.
+unset LINES COLUMNS
+tui_resizable() {
+    local prog="$1"; shift
+    local a fd rc
+    for a in "$@"; do
+        case "$a" in
+            --infobox|--progressbox|--programbox|--gauge|--prgbox|--tailboxbg) command "$prog" "$@"; return ;;
+        esac
+    done
+    local old_int
+    old_int="$(trap -p INT)"
+    exec {fd}<&0          # keep our stdin (the terminal) for the background copy
+    TUI_INT=0
+    # A background command ignores Ctrl+C, so pass it on ourselves: close the window and report
+    # it the way an interrupted dialog did (status 130, GOT_INT set) so Ctrl+C still goes one step back.
+    trap 'GOT_INT=1; TUI_INT=1; kill -TERM "$TUI_CHILD" 2>/dev/null' INT
+    while :; do
+        TUI_WINCH=0
+        command "$prog" "$@" <&"$fd" &
+        TUI_CHILD=$!
+        trap 'TUI_WINCH=1; kill -TERM "$TUI_CHILD" 2>/dev/null' WINCH
+        wait "$TUI_CHILD"; rc=$?
+        # wait returns early when a trapped signal arrives; wait until the window has really closed
+        while kill -0 "$TUI_CHILD" 2>/dev/null; do wait "$TUI_CHILD"; rc=$?; done
+        trap - WINCH
+        (( TUI_INT )) && { rc=130; break; }
+        (( TUI_WINCH )) || break
+        sleep 0.2         # a window drag sends many resize events; let them settle
+    done
+    exec {fd}<&-
+    if [[ -n "$old_int" ]]; then eval "$old_int"; else trap - INT; fi
+    return "$rc"
+}
+dialog()   { tui_resizable dialog "$@"; }
+whiptail() { tui_resizable whiptail "$@"; }
+
 dlg() {
     flush_input
     dialog --backtitle "$BACKTITLE" \
@@ -301,6 +344,45 @@ valid_port() {
 }
 valid_ipcidr() { [[ "$1" =~ ^[0-9A-Fa-f:.]+(/[0-9]{1,3})?$ ]]; }
 
+# split_list "<a, b,c d>" -> LIST=(a b c d): commas and/or spaces, empty items and duplicates dropped
+split_list() {
+    local x; local -A seen=()
+    LIST=()
+    for x in ${1//,/ }; do
+        [[ -n "${seen[$x]:-}" ]] && continue
+        seen[$x]=1; LIST+=("$x")
+    done
+}
+# bad_items <validator> -> BAD=(items in LIST the validator rejects)
+bad_items() {
+    local x; BAD=()
+    for x in "${LIST[@]}"; do "$1" "$x" || BAD+=("$x"); done
+}
+# show a list one item per line, at most 12 lines
+list_lines() {
+    local n=0 x out=""
+    for x in "$@"; do
+        (( n++ < 12 )) && out+="    $x\n"
+    done
+    (( $# > 12 )) && out+="    … $(L "외 $(( $# - 12 ))개" "and $(( $# - 12 )) more")\n"
+    printf '%s' "$out"
+}
+# run firewall-cmd for each item; collect output. FW_OK / FW_FAIL count the results
+fw_each() {      # fw_each <zone> <--add-port|--remove-port|--add-source|...> items...
+    local zone="$1" op="$2"; shift 2
+    local x
+    FW_OK=0; FW_FAIL=0; : >"$TMP_OUT"
+    for x in "$@"; do
+        if firewall-cmd --zone="$zone" "$op=$x" --permanent >>"$TMP_OUT" 2>&1; then
+            (( FW_OK++ ))
+        else
+            (( FW_FAIL++ )); echo "  ↑ $x" >>"$TMP_OUT"
+        fi
+    done
+    (( FW_OK > 0 )) && firewall-cmd --reload >>"$TMP_OUT" 2>&1
+    return 0
+}
+
 # --- warning before a change that can cut the remote session ---
 guard_armed() { systemctl is-active --quiet safetui-guard.timer 2>/dev/null; }
 
@@ -350,91 +432,107 @@ lockout_check() {
 }
 
 fw_add_port() {
-    local zone port proto
+    local zone proto items=() x
     zone="$(fw_pick_zone)" || return
-    port="$(dlg_input "$(L '포트 추가' 'Add port')" \
-        "$(L '열고 싶은 포트 번호를 입력하세요.\n예) 8080  또는  8000-8100 (범위)' \
-             'Enter the port to open.\ne.g. 8080  or  8000-8100 (range)')")" || return
-    [[ -z "$port" ]] && { msg "$(L '포트 추가' 'Add port')" "$(L '포트 번호가 비어 있습니다.' 'Port is empty.')"; return; }
-    valid_port "$port" || { msg "$(L '포트 추가' 'Add port')" "$(L "'$port' 는 올바른 포트가 아닙니다.\n숫자(예: 8080) 또는 범위(예: 8000-8100)로 입력하세요." "'$port' is not a valid port.\nUse a number (e.g. 8080) or a range (e.g. 8000-8100).")" 10; return; }
+    x="$(dlg_input "$(L '포트 추가' 'Add port')" \
+        "$(L '열고 싶은 포트 번호를 입력하세요. 여러 개는 쉼표로 구분합니다.\n예) 8080   8000-8100   3030,1234,10000-12000' \
+             'Enter the port(s) to open. Separate several with commas.\ne.g. 8080   8000-8100   3030,1234,10000-12000')")" || return
+    split_list "$x"
+    [[ ${#LIST[@]} -eq 0 ]] && { msg "$(L '포트 추가' 'Add port')" "$(L '포트 번호가 비어 있습니다.' 'Port is empty.')"; return; }
+    bad_items valid_port
+    if (( ${#BAD[@]} )); then
+        msg "$(L '포트 추가' 'Add port')" "$(L '올바르지 않은 포트가 있어 아무것도 추가하지 않았습니다.' 'Some ports are not valid, so nothing was added.')\n\n$(list_lines "${BAD[@]}")\n$(L '숫자(1~65535) 또는 범위(예: 8000-8100)로 입력하세요.' 'Use a number (1-65535) or a range (e.g. 8000-8100).')" 14
+        return
+    fi
 
-    proto="$(dlg --title "$(L '프로토콜 선택' 'Select protocol')" --menu "$(L '프로토콜을 선택하세요.' 'Select a protocol.')" 11 "$DLG_W" 3 \
+    proto="$(dlg --title "$(L '프로토콜 선택' 'Select protocol')" --menu "$(L '프로토콜을 선택하세요. (입력한 포트 모두에 적용)' 'Select a protocol (applies to all the ports).')" 11 "$DLG_W" 3 \
         tcp "$(L '일반적인 웹/앱 (대부분 tcp)' 'Common web/app (usually tcp)')" \
         udp "$(L 'DNS, VPN 등' 'DNS, VPN, etc.')" )" || return
+    for x in "${LIST[@]}"; do items+=("$x/$proto"); done
 
-    if yesno "$(L '확인' 'Confirm')" "$(L '다음 정책을 [영구]로 추가합니다.' 'Add the following rule [permanent].')\n\n  $(L '존' 'zone'): $zone\n  $(L '포트' 'port'): ${port}/${proto}\n\n$(L '진행할까요?' 'Proceed?')"; then
-        if firewall-cmd --zone="$zone" --add-port="${port}/${proto}" --permanent >"$TMP_OUT" 2>&1; then
-            firewall-cmd --reload >>"$TMP_OUT" 2>&1
-            msg "$(L '포트 추가 — 성공' 'Add port — OK')" "$(L "${port}/${proto} 포트를 '$zone' 존에서 모두에게 열었습니다.\n재부팅 후에도 유지됩니다." "Opened ${port}/${proto} to everyone in zone '$zone'.\nIt persists across reboots.")\n\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" 14
+    if yesno "$(L '확인' 'Confirm')" "$(L "다음 포트 ${#items[@]}개를 [영구]로 모두에게 엽니다." "Open these ${#items[@]} port(s) to everyone [permanent].")\n\n  $(L '존' 'zone'): $zone\n$(list_lines "${items[@]}")\n$(L '진행할까요?' 'Proceed?')" "$(( (${#items[@]} > 12 ? 13 : ${#items[@]}) + 10 ))"; then
+        fw_each "$zone" --add-port "${items[@]}"
+        if (( FW_FAIL == 0 )); then
+            msg "$(L '포트 추가 — 성공' 'Add port — OK')" "$(L "'$zone' 존에서 포트 ${FW_OK}개를 모두에게 열었습니다.\n재부팅 후에도 유지됩니다." "Opened ${FW_OK} port(s) to everyone in zone '$zone'.\nIt persists across reboots.")\n\n$(list_lines "${items[@]}")\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" "$DLG_H"
         else
-            msg "$(L '포트 추가 — 실패' 'Add port — Failed')" "$(cat "$TMP_OUT")"
+            msg "$(L '포트 추가 — 일부 실패' 'Add port — some failed')" "$(L "성공 ${FW_OK}개, 실패 ${FW_FAIL}개" "${FW_OK} added, ${FW_FAIL} failed")\n\n$(cat "$TMP_OUT")" "$DLG_H"
         fi
     fi
 }
 
 fw_del_port() {
-    local zone port ports args=()
+    local zone ports p sel=() args=() hits=()
     zone="$(fw_pick_zone)" || return
     ports="$(firewall-cmd --zone="$zone" --list-ports 2>/dev/null)"
     if [[ -z "$ports" ]]; then
         msg "$(L '포트 삭제' 'Remove port')" "$(L '이 존에 등록된 포트가 없습니다.' 'No ports registered in this zone.') ($zone)"
         return
     fi
-    for p in $ports; do args+=("$p" " "); done
-    port="$(dlg --title "$(L '포트 삭제' 'Remove port')" --menu "$(L '삭제할 포트를 선택하세요.' 'Select a port to remove.') ($zone)" \
-        18 "$DLG_W" "$MENU_H" "${args[@]}")" || return
+    for p in $ports; do args+=("$p" " " off); done
+    mapfile -t sel < <(dlg --title "$(L '포트 삭제' 'Remove port')" --separate-output \
+        --checklist "$(L '삭제할 포트를 고르세요. (스페이스로 선택, 여러 개 가능)' 'Select the port(s) to remove. (Space to select, several allowed)') ($zone)" \
+        "$DLG_H" "$DLG_W" "$MENU_H" "${args[@]}") || return
+    [[ ${#sel[@]} -eq 0 ]] && { msg "$(L '포트 삭제' 'Remove port')" "$(L '선택한 포트가 없습니다. 스페이스로 고른 뒤 확인을 누르세요.' 'Nothing selected. Press Space on an item, then OK.')" 8; return; }
 
-    if port_hits_remote "$port"; then
-        lockout_check "$(L "포트 $port 삭제 ($zone 존) — 원격 접속(SSH) 포트입니다" "remove port $port ($zone) — this is a remote-access (SSH) port")" || return
+    for p in "${sel[@]}"; do port_hits_remote "$p" && hits+=("$p"); done
+    if (( ${#hits[@]} )); then
+        lockout_check "$(L "포트 ${hits[*]} 삭제 ($zone 존) — 원격 접속(SSH) 포트입니다" "remove port ${hits[*]} ($zone) — remote-access (SSH) port")" || return
     fi
-    if yesno "$(L '확인' 'Confirm')" "$(L '다음 포트 정책을 삭제합니다.' 'Remove the following port rule.')\n\n  $(L '존' 'zone'): $zone\n  $(L '포트' 'port'): $port\n\n$(L '진행할까요?' 'Proceed?')"; then
-        if firewall-cmd --zone="$zone" --remove-port="$port" --permanent >"$TMP_OUT" 2>&1; then
-            firewall-cmd --reload >>"$TMP_OUT" 2>&1
-            msg "$(L '포트 삭제 — 성공' 'Remove port — OK')" "$(L "'$zone' 존에서 $port 포트를 닫았습니다." "Closed $port in zone '$zone'.")\n\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" 14
+    if yesno "$(L '확인' 'Confirm')" "$(L "다음 포트 ${#sel[@]}개를 닫습니다." "Close these ${#sel[@]} port(s).")\n\n  $(L '존' 'zone'): $zone\n$(list_lines "${sel[@]}")\n$(L '진행할까요?' 'Proceed?')" "$(( (${#sel[@]} > 12 ? 13 : ${#sel[@]}) + 10 ))"; then
+        fw_each "$zone" --remove-port "${sel[@]}"
+        if (( FW_FAIL == 0 )); then
+            msg "$(L '포트 삭제 — 성공' 'Remove port — OK')" "$(L "'$zone' 존에서 포트 ${FW_OK}개를 닫았습니다." "Closed ${FW_OK} port(s) in zone '$zone'.")\n\n$(list_lines "${sel[@]}")\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" "$DLG_H"
         else
-            msg "$(L '포트 삭제 — 실패' 'Remove port — Failed')" "$(cat "$TMP_OUT")"
+            msg "$(L '포트 삭제 — 일부 실패' 'Remove port — some failed')" "$(L "성공 ${FW_OK}개, 실패 ${FW_FAIL}개" "${FW_OK} removed, ${FW_FAIL} failed")\n\n$(cat "$TMP_OUT")" "$DLG_H"
         fi
     fi
 }
 
 fw_add_source() {
-    local zone ip
+    local zone x
     zone="$(fw_pick_zone)" || return
-    ip="$(dlg_input "$(L '출발지 IP를 존에 등록' 'Assign source IP to zone')" \
-        "$(L "이 IP/대역에서 오는 접속에 '$zone' 존의 규칙을 적용합니다.\n예) 192.168.0.10  또는  192.168.0.0/24\n\n※ '특정 IP만 어떤 포트에 접속 허용'이 목적이면\n   '특정 IP에서만 포트 허용' 메뉴를 쓰세요." \
-             "Traffic from this IP/CIDR will use the '$zone' zone rules.\ne.g. 192.168.0.10  or  192.168.0.0/24\n\n* To allow ONLY a specific IP to reach a port,\n  use 'Allow a port only from a specific IP'.")")" || return
-    [[ -z "$ip" ]] && { msg "$(L '출발지 IP 등록' 'Assign source IP')" "$(L 'IP가 비어 있습니다.' 'IP is empty.')"; return; }
-    valid_ipcidr "$ip" || { msg "$(L '출발지 IP 등록' 'Assign source IP')" "$(L "'$ip' 는 올바른 IP/대역이 아닙니다." "'$ip' is not a valid IP/CIDR.")" 8; return; }
+    x="$(dlg_input "$(L '출발지 IP를 존에 등록' 'Assign source IP to zone')" \
+        "$(L "이 IP/대역에서 오는 접속에 '$zone' 존의 규칙을 적용합니다.\n여러 개는 쉼표로 구분합니다.\n예) 192.168.0.10   192.168.0.0/24   10.0.0.1,10.0.0.2\n\n※ '특정 IP만 어떤 포트에 접속 허용'이 목적이면\n   '특정 IP에서만 포트 허용' 메뉴를 쓰세요." \
+             "Traffic from these IPs/CIDRs will use the '$zone' zone rules.\nSeparate several with commas.\ne.g. 192.168.0.10   192.168.0.0/24   10.0.0.1,10.0.0.2\n\n* To allow ONLY a specific IP to reach a port,\n  use 'Allow a port only from a specific IP'.")")" || return
+    split_list "$x"
+    [[ ${#LIST[@]} -eq 0 ]] && { msg "$(L '출발지 IP 등록' 'Assign source IP')" "$(L 'IP가 비어 있습니다.' 'IP is empty.')"; return; }
+    bad_items valid_ipcidr
+    if (( ${#BAD[@]} )); then
+        msg "$(L '출발지 IP 등록' 'Assign source IP')" "$(L '올바르지 않은 IP/대역이 있어 아무것도 등록하지 않았습니다.' 'Some entries are not valid IPs/CIDRs, so nothing was added.')\n\n$(list_lines "${BAD[@]}")" 12
+        return
+    fi
 
-    if yesno "$(L '확인' 'Confirm')" "$(L '다음 출발지(source)를 존에 [영구]로 허용합니다.' 'Allow the following source [permanent].')\n\n  $(L '존' 'zone'): $zone\n  IP: $ip\n\n$(L '진행할까요?' 'Proceed?')"; then
-        if firewall-cmd --zone="$zone" --add-source="$ip" --permanent >"$TMP_OUT" 2>&1; then
-            firewall-cmd --reload >>"$TMP_OUT" 2>&1
-            msg "$(L '출발지 IP 등록 — 성공' 'Assign source IP — OK')" "$(L "$ip 에서 오는 접속에 이제 '$zone' 존 규칙이 적용됩니다." "Traffic from $ip now uses the '$zone' zone rules.")\n\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" 14
+    if yesno "$(L '확인' 'Confirm')" "$(L "다음 출발지 ${#LIST[@]}개를 존에 [영구]로 등록합니다." "Assign these ${#LIST[@]} source(s) to the zone [permanent].")\n\n  $(L '존' 'zone'): $zone\n$(list_lines "${LIST[@]}")\n$(L '진행할까요?' 'Proceed?')" "$(( (${#LIST[@]} > 12 ? 13 : ${#LIST[@]}) + 10 ))"; then
+        fw_each "$zone" --add-source "${LIST[@]}"
+        if (( FW_FAIL == 0 )); then
+            msg "$(L '출발지 IP 등록 — 성공' 'Assign source IP — OK')" "$(L "이제 아래 ${FW_OK}개에서 오는 접속에 '$zone' 존 규칙이 적용됩니다." "Traffic from these ${FW_OK} source(s) now uses the '$zone' zone rules.")\n\n$(list_lines "${LIST[@]}")\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" "$DLG_H"
         else
-            msg "$(L '출발지 IP 등록 — 실패' 'Assign source IP — Failed')" "$(cat "$TMP_OUT")"
+            msg "$(L '출발지 IP 등록 — 일부 실패' 'Assign source IP — some failed')" "$(L "성공 ${FW_OK}개, 실패 ${FW_FAIL}개" "${FW_OK} added, ${FW_FAIL} failed")\n\n$(cat "$TMP_OUT")" "$DLG_H"
         fi
     fi
 }
 
 fw_del_source() {
-    local zone ip sources args=()
+    local zone sources x sel=() args=()
     zone="$(fw_pick_zone)" || return
     sources="$(firewall-cmd --zone="$zone" --list-sources 2>/dev/null)"
     if [[ -z "$sources" ]]; then
         msg "$(L '출발지 IP 등록 삭제' 'Remove source IP')" "$(L '이 존에 등록된 출발지 IP가 없습니다.' 'No source IPs in this zone.') ($zone)"
         return
     fi
-    for s in $sources; do args+=("$s" " "); done
-    ip="$(dlg --title "$(L '출발지 IP 등록 삭제' 'Remove source IP')" --menu "$(L '삭제할 출발지 IP를 선택하세요.' 'Select a source IP to remove.') ($zone)" \
-        18 "$DLG_W" "$MENU_H" "${args[@]}")" || return
+    for x in $sources; do args+=("$x" " " off); done
+    mapfile -t sel < <(dlg --title "$(L '출발지 IP 등록 삭제' 'Remove source IP')" --separate-output \
+        --checklist "$(L '삭제할 출발지 IP를 고르세요. (스페이스로 선택, 여러 개 가능)' 'Select the source IP(s) to remove. (Space to select, several allowed)') ($zone)" \
+        "$DLG_H" "$DLG_W" "$MENU_H" "${args[@]}") || return
+    [[ ${#sel[@]} -eq 0 ]] && { msg "$(L '출발지 IP 등록 삭제' 'Remove source IP')" "$(L '선택한 IP가 없습니다. 스페이스로 고른 뒤 확인을 누르세요.' 'Nothing selected. Press Space on an item, then OK.')" 8; return; }
 
-    lockout_check "$(L "출발지 IP $ip 삭제 ($zone 존) — 이 IP 로 접속 중이라면 끊길 수 있습니다" "remove source $ip ($zone) — you may be cut off if you connect from it")" || return
-    if yesno "$(L '확인' 'Confirm')" "$(L '다음 출발지를 존에서 삭제합니다.' 'Remove this source from the zone.')\n  $ip ($zone)\n\n$(L '진행할까요?' 'Proceed?')"; then
-        if firewall-cmd --zone="$zone" --remove-source="$ip" --permanent >"$TMP_OUT" 2>&1; then
-            firewall-cmd --reload >>"$TMP_OUT" 2>&1
-            msg "$(L '출발지 IP 등록 삭제 — 성공' 'Remove source IP — OK')" "$(L "$ip 를 '$zone' 존에서 뺐습니다." "Removed $ip from zone '$zone'.")\n\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" 14
+    lockout_check "$(L "출발지 IP ${sel[*]} 삭제 ($zone 존) — 이 IP 로 접속 중이라면 끊길 수 있습니다" "remove source ${sel[*]} ($zone) — you may be cut off if you connect from it")" || return
+    if yesno "$(L '확인' 'Confirm')" "$(L "다음 출발지 ${#sel[@]}개를 존에서 삭제합니다." "Remove these ${#sel[@]} source(s) from the zone.")\n\n  $(L '존' 'zone'): $zone\n$(list_lines "${sel[@]}")\n$(L '진행할까요?' 'Proceed?')" "$(( (${#sel[@]} > 12 ? 13 : ${#sel[@]}) + 10 ))"; then
+        fw_each "$zone" --remove-source "${sel[@]}"
+        if (( FW_FAIL == 0 )); then
+            msg "$(L '출발지 IP 등록 삭제 — 성공' 'Remove source IP — OK')" "$(L "'$zone' 존에서 ${FW_OK}개를 뺐습니다." "Removed ${FW_OK} source(s) from zone '$zone'.")\n\n$(list_lines "${sel[@]}")\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" "$DLG_H"
         else
-            msg "$(L '출발지 IP 등록 삭제 — 실패' 'Remove source IP — Failed')" "$(cat "$TMP_OUT")"
+            msg "$(L '출발지 IP 등록 삭제 — 일부 실패' 'Remove source IP — some failed')" "$(L "성공 ${FW_OK}개, 실패 ${FW_FAIL}개" "${FW_OK} removed, ${FW_FAIL} failed")\n\n$(cat "$TMP_OUT")" "$DLG_H"
         fi
     fi
 }
@@ -450,60 +548,72 @@ rich_human() {
 
 # allow a port from one IP only (firewalld rich rule)
 fw_add_ip_port_rule() {
-    local zone ip port proto fam rule
+    local zone x proto fam ips=() ports=() rules=() human=() ip port
     zone="$(fw_pick_zone)" || return
-    ip="$(dlg_input "$(L '특정 IP에서만 포트 허용 (1/3)' 'Allow a port only from a specific IP (1/3)')" \
-        "$(L '접속을 허용할 출발지 IP 또는 대역을 입력하세요.\n예) 192.168.0.10  또는  192.168.0.0/24' \
-             'Enter the source IP or CIDR to allow.\ne.g. 192.168.0.10  or  192.168.0.0/24')")" || return
-    [[ -z "$ip" ]] && return
-    valid_ipcidr "$ip" || { msg "$(L '특정 IP에서만 포트 허용' 'Allow port from IP')" "$(L "'$ip' 는 올바른 IP/대역이 아닙니다." "'$ip' is not a valid IP/CIDR.")" 8; return; }
-    port="$(dlg_input "$(L '특정 IP에서만 포트 허용 (2/3)' 'Allow a port only from a specific IP (2/3)')" \
-        "$(L "$ip 에게 열어줄 포트 번호를 입력하세요.\n예) 3306  또는  8000-8100" \
-             "Port to open for $ip.\ne.g. 3306  or  8000-8100")")" || return
-    [[ -z "$port" ]] && return
-    valid_port "$port" || { msg "$(L '특정 IP에서만 포트 허용' 'Allow port from IP')" "$(L "'$port' 는 올바른 포트가 아닙니다." "'$port' is not a valid port.")" 8; return; }
+    x="$(dlg_input "$(L '특정 IP에서만 포트 허용 (1/3)' 'Allow a port only from a specific IP (1/3)')" \
+        "$(L '접속을 허용할 출발지 IP 또는 대역을 입력하세요. 여러 개는 쉼표로.\n예) 192.168.0.10   192.168.0.0/24   10.0.0.1,10.0.0.2' \
+             'Enter the source IP(s) or CIDR(s) to allow. Separate several with commas.\ne.g. 192.168.0.10   192.168.0.0/24   10.0.0.1,10.0.0.2')")" || return
+    split_list "$x"; [[ ${#LIST[@]} -eq 0 ]] && return
+    bad_items valid_ipcidr
+    (( ${#BAD[@]} )) && { msg "$(L '특정 IP에서만 포트 허용' 'Allow port from IP')" "$(L '올바르지 않은 IP/대역이 있습니다.' 'Some entries are not valid IPs/CIDRs.')\n\n$(list_lines "${BAD[@]}")" 12; return; }
+    ips=("${LIST[@]}")
+
+    x="$(dlg_input "$(L '특정 IP에서만 포트 허용 (2/3)' 'Allow a port only from a specific IP (2/3)')" \
+        "$(L "${ips[*]} 에게 열어줄 포트를 입력하세요. 여러 개는 쉼표로.\n예) 3306   8000-8100   3306,8080" \
+             "Port(s) to open for ${ips[*]}. Separate several with commas.\ne.g. 3306   8000-8100   3306,8080")")" || return
+    split_list "$x"; [[ ${#LIST[@]} -eq 0 ]] && return
+    bad_items valid_port
+    (( ${#BAD[@]} )) && { msg "$(L '특정 IP에서만 포트 허용' 'Allow port from IP')" "$(L '올바르지 않은 포트가 있습니다.' 'Some ports are not valid.')\n\n$(list_lines "${BAD[@]}")" 12; return; }
+    ports=("${LIST[@]}")
+
     proto="$(dlg --title "$(L '특정 IP에서만 포트 허용 (3/3)' 'Allow a port only from a specific IP (3/3)')" \
         --menu "$(L '프로토콜을 선택하세요.' 'Select a protocol.')" 11 "$DLG_W" 2 \
         tcp "$(L '일반적인 웹/앱/DB (대부분 tcp)' 'Common web/app/DB (usually tcp)')" \
         udp "$(L 'DNS, VPN 등' 'DNS, VPN, etc.')")" || return
-    fam="ipv4"; [[ "$ip" == *:* ]] && fam="ipv6"
-    rule="rule family=\"$fam\" source address=\"$ip\" port port=\"$port\" protocol=\"$proto\" accept"
+    for ip in "${ips[@]}"; do
+        fam="ipv4"; [[ "$ip" == *:* ]] && fam="ipv6"
+        for port in "${ports[@]}"; do
+            rules+=("rule family=\"$fam\" source address=\"$ip\" port port=\"$port\" protocol=\"$proto\" accept")
+            human+=("$ip → ${port}/${proto}")
+        done
+    done
 
-    yesno "$(L '확인' 'Confirm')" "$(L '다음 규칙을 [영구]로 추가합니다.' 'Add the following rule [permanent].')\n\n  $(L '존' 'zone'): $zone\n  $(L '허용 IP' 'from'): $ip\n  $(L '포트' 'port'): ${port}/${proto}\n\n$(L "※ 이 포트가 '포트 추가'로 모두에게 열려 있다면\n   이 규칙과 상관없이 모두 접속 가능합니다." "* If this port is also opened to everyone via 'Add port',\n  everyone can still connect regardless of this rule.")\n\n$(L '진행할까요?' 'Proceed?')" 16 || return
-    if firewall-cmd --zone="$zone" --add-rich-rule="$rule" --permanent >"$TMP_OUT" 2>&1; then
-        firewall-cmd --reload >>"$TMP_OUT" 2>&1
-        msg "$(L '특정 IP 허용 — 성공' 'Allow from IP — OK')" "$(L "이제 $ip 에서만 ${port}/${proto} 포트로 접속할 수 있습니다. ('$zone' 존)\n재부팅 후에도 유지됩니다." "Now only $ip can connect to ${port}/${proto} (zone '$zone').\nIt persists across reboots.")\n\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" 14
+    yesno "$(L '확인' 'Confirm')" "$(L "다음 규칙 ${#rules[@]}개를 [영구]로 추가합니다." "Add these ${#rules[@]} rule(s) [permanent].")\n\n  $(L '존' 'zone'): $zone\n$(list_lines "${human[@]}")\n$(L "※ 이 포트가 '포트 추가'로 모두에게 열려 있다면\n   이 규칙과 상관없이 모두 접속 가능합니다." "* If a port is also opened to everyone via 'Add port',\n  everyone can still connect regardless of this rule.")\n\n$(L '진행할까요?' 'Proceed?')" "$(( (${#rules[@]} > 12 ? 13 : ${#rules[@]}) + 13 ))" || return
+    fw_each "$zone" --add-rich-rule "${rules[@]}"
+    if (( FW_FAIL == 0 )); then
+        msg "$(L '특정 IP 허용 — 성공' 'Allow from IP — OK')" "$(L "규칙 ${FW_OK}개를 추가했습니다. ('$zone' 존, 재부팅 후에도 유지)" "Added ${FW_OK} rule(s) (zone '$zone', persists across reboots).")\n\n$(list_lines "${human[@]}")\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" "$DLG_H"
     else
-        msg "$(L '특정 IP 허용 — 실패' 'Allow from IP — Failed')" "$(cat "$TMP_OUT")"
+        msg "$(L '특정 IP 허용 — 일부 실패' 'Allow from IP — some failed')" "$(L "성공 ${FW_OK}개, 실패 ${FW_FAIL}개" "${FW_OK} added, ${FW_FAIL} failed")\n\n$(cat "$TMP_OUT")" "$DLG_H"
     fi
 }
 
 fw_del_ip_port_rule() {
-    local zone rules args=() i=0 r idx rule
+    local zone rules args=() i=0 r idx sel=() pick=() human=() rport warn=""
     zone="$(fw_pick_zone)" || return
     mapfile -t rules < <(firewall-cmd --zone="$zone" --list-rich-rules 2>/dev/null)
     if [[ ${#rules[@]} -eq 0 ]]; then
         msg "$(L '특정 IP 허용 규칙 삭제' 'Remove IP rule')" "$(L '이 존에 등록된 규칙이 없습니다.' 'No rules in this zone.') ($zone)" 8
         return
     fi
-    for r in "${rules[@]}"; do args+=("$i" "$(rich_human <<<"$r")"); ((i++)); done
-    idx="$(dlg --title "$(L '특정 IP 허용 규칙 삭제' 'Remove IP rule')" \
-        --menu "$(L '삭제할 규칙을 선택하세요.' 'Select a rule to remove.') ($zone)" \
-        "$DLG_H" "$DLG_W" "$MENU_H" "${args[@]}")" || return
-    rule="${rules[$idx]}"
-    local rport
-    rport="$(sed -n 's/.*port port="\([0-9-]*\)".*/\1/p' <<<"$rule")"
-    if [[ -n "$rport" ]] && port_hits_remote "$rport"; then
-        lockout_check "$(L "원격 접속 포트($rport) 규칙 삭제" "remove a rule for the remote-access port ($rport)")" || return
-    elif [[ "$rule" == *'service name="ssh"'* ]]; then
-        lockout_check "$(L "ssh 서비스 규칙 삭제" "remove an ssh service rule")" || return
-    fi
-    yesno "$(L '확인' 'Confirm')" "$(L '다음 규칙을 삭제합니다.' 'Remove this rule.')\n\n  $rule\n\n$(L '진행할까요?' 'Proceed?')" 12 || return
-    if firewall-cmd --zone="$zone" --remove-rich-rule="$rule" --permanent >"$TMP_OUT" 2>&1; then
-        firewall-cmd --reload >>"$TMP_OUT" 2>&1
-        msg "$(L '규칙 삭제 — 성공' 'Remove rule — OK')" "$(L "규칙을 삭제했습니다:" "Removed rule:") $(rich_human <<<"$rule")\n\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" 14
+    for r in "${rules[@]}"; do args+=("$i" "$(rich_human <<<"$r")" off); ((i++)); done
+    mapfile -t sel < <(dlg --title "$(L '특정 IP 허용 규칙 삭제' 'Remove IP rule')" --separate-output \
+        --checklist "$(L '삭제할 규칙을 고르세요. (스페이스로 선택, 여러 개 가능)' 'Select the rule(s) to remove. (Space to select, several allowed)') ($zone)" \
+        "$DLG_H" "$DLG_W" "$MENU_H" "${args[@]}") || return
+    [[ ${#sel[@]} -eq 0 ]] && { msg "$(L '특정 IP 허용 규칙 삭제' 'Remove IP rule')" "$(L '선택한 규칙이 없습니다. 스페이스로 고른 뒤 확인을 누르세요.' 'Nothing selected. Press Space on an item, then OK.')" 8; return; }
+    for idx in "${sel[@]}"; do
+        [[ "$idx" =~ ^[0-9]+$ ]] || continue
+        r="${rules[$idx]}"; pick+=("$r"); human+=("$(rich_human <<<"$r")")
+        rport="$(sed -n 's/.*port port="\([0-9-]*\)".*/\1/p' <<<"$r")"
+        if [[ -n "$rport" ]] && port_hits_remote "$rport"; then warn="$(L "원격 접속 포트($rport) 규칙 삭제" "remove a rule for the remote-access port ($rport)")"
+        elif [[ "$r" == *'service name="ssh"'* ]]; then warn="$(L "ssh 서비스 규칙 삭제" "remove an ssh service rule")"; fi
+    done
+    [[ -n "$warn" ]] && { lockout_check "$warn" || return; }
+    yesno "$(L '확인' 'Confirm')" "$(L "다음 규칙 ${#pick[@]}개를 삭제합니다." "Remove these ${#pick[@]} rule(s).")\n\n$(list_lines "${human[@]}")\n$(L '진행할까요?' 'Proceed?')" "$(( (${#pick[@]} > 12 ? 13 : ${#pick[@]}) + 8 ))" || return
+    fw_each "$zone" --remove-rich-rule "${pick[@]}"
+    if (( FW_FAIL == 0 )); then
+        msg "$(L '규칙 삭제 — 성공' 'Remove rule — OK')" "$(L "규칙 ${FW_OK}개를 삭제했습니다." "Removed ${FW_OK} rule(s).")\n\n$(list_lines "${human[@]}")\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" "$DLG_H"
     else
-        msg "$(L '규칙 삭제 — 실패' 'Remove rule — Failed')" "$(cat "$TMP_OUT")"
+        msg "$(L '규칙 삭제 — 일부 실패' 'Remove rule — some failed')" "$(L "성공 ${FW_OK}개, 실패 ${FW_FAIL}개" "${FW_OK} removed, ${FW_FAIL} failed")\n\n$(cat "$TMP_OUT")" "$DLG_H"
     fi
 }
 
@@ -2331,9 +2441,9 @@ info_menu() {
 # ---------------------------------------------------------------------------
 lang_menu() {
     local choice
-    choice="$(dlg --title "$(L '언어 / Language' 'Language / 언어')" --cancel-label "$(L '뒤로' 'Back')" \
+    choice="$(dlg --title "$(L '언어 / Language' 'Language')" --cancel-label "$(L '뒤로' 'Back')" \
         --menu "$(L '언어를 선택하세요.' 'Select a language.')" 11 "$DLG_W" 2 \
-        ko "$(L '한국어' 'Korean (한국어)')" \
+        ko "$(L '한국어' 'Korean')" \
         en "$(L 'English (영어)' 'English')")" || return
     case "$choice" in
         ko) LANG_MODE="ko"; save_lang ;;
@@ -2357,7 +2467,7 @@ main_menu() {
             2 "$(L 'SELinux 관리' 'SELinux')" \
             3 "$(L '작업 안전장치' 'Lockout guard')" \
             4 "$(L '백업' 'Backup')" \
-            5 "$(L '언어 변경 / Language' 'Language / 언어')" \
+            5 "$(L '언어 변경 / Language' 'Language')" \
             6 "$(L '정보 / 도움말' 'About / Help')")"
         rc=$?
         # Only the <Quit> button (1) ends the program. ESC / Ctrl+C do not quit; they just move the cursor to <Quit>

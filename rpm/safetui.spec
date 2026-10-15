@@ -1,5 +1,5 @@
 Name:           safetui
-Version:        3.1.2
+Version:        3.2.0
 Release:        1%{?dist}
 Summary:        Menu-driven firewall, SELinux, lockout guard and backup tool
 
@@ -79,6 +79,18 @@ fi
 %dir %attr(0700,root,root) %{_sharedstatedir}/safetui-guard
 
 %changelog
+* Thu Oct 15 2026 JJ <mrwhitehacker@naver.com> - 3.2.0-1
+- Firewall: add several ports at once, separated by commas
+  (e.g. 3030,1234,10000-12000); nothing is added if one of them is invalid
+- Firewall: remove several ports, source IPs or IP-specific rules at once
+  (checklist instead of a single choice)
+- Firewall: assign several source IPs at once, and create IP-specific rules
+  for several IPs and ports in one go (every IP x every port)
+- The window is redrawn in the middle when the terminal is resized while it
+  is shown (dialog left it where it was, cut off at the edge)
+- English screens no longer show Korean text in the language menu (it showed
+  as boxes on the Linux console)
+
 * Thu Oct 15 2026 JJ <mrwhitehacker@naver.com> - 3.1.2-1
 - Lockout guard, network rollback: bring back only the connections that were
   active when the guard was armed, each on its own device. Before, every profile

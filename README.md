@@ -36,7 +36,10 @@ All versions are on the [Releases](https://github.com/KTdisbandplease/safetui/re
 ### Firewall (firewalld)
 - View open ports, services and allowed source IPs; whole policy at a glance
 - Open / close ports, add / remove services
-- **Allow a port from one IP only** (rich rule), shown as a plain sentence
+- **Several at once**: type `3030,1234,10000-12000` to open many ports in one go; pick
+  several ports, source IPs or rules from a checklist to remove them together
+- **Allow a port from one IP only** (rich rule), shown as a plain sentence — several IPs
+  and ports at once create one rule for every IP x port
 - Warns before a change that could cut your own SSH session (removing the `ssh` service,
   the SSH port, or a source IP) and offers to arm the lockout guard first
 - Every change is saved with `--permanent` and reloaded
