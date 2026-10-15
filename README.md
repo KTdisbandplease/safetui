@@ -9,6 +9,16 @@ one screen, without having to remember the commands.
   `safetui --english` / `safetui --korean`
 - Pure shell scripts on top of `dialog` / `whiptail`. No daemon, no open port.
 
+<p align="center">
+  <img src="docs/screenshots/main.png" alt="safetui main menu" width="640">
+</p>
+
+## Screenshots
+
+| Lockout guard (countdown at the top right) | Firewall | Backup |
+|---|---|---|
+| ![Lockout guard armed, rollback countdown](docs/screenshots/guard.png) | ![Firewall menu](docs/screenshots/firewall.png) | ![Backup menu](docs/screenshots/backup.png) |
+
 ## Download
 
 **[Download the latest RPM](https://github.com/KTdisbandplease/safetui/releases/latest/download/safetui-latest.el9.noarch.rpm)**
