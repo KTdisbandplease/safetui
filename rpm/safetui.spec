@@ -1,5 +1,5 @@
 Name:           safetui
-Version:        3.1.0
+Version:        3.1.1
 Release:        1%{?dist}
 Summary:        Menu-driven firewall, SELinux, lockout guard and backup tool
 
@@ -79,6 +79,10 @@ fi
 %dir %attr(0700,root,root) %{_sharedstatedir}/safetui-guard
 
 %changelog
+* Thu Oct 15 2026 JJ <mrwhitehacker@naver.com> - 3.1.1-1
+- Fix: after switching the language in the menu, the lockout guard countdown
+  at the top right kept showing the previous language until safetui was restarted
+
 * Mon Oct 12 2026 JJ <mrwhitehacker@naver.com> - 3.1.0-1
 - Lockout guard: a rollback now also brings services back. If firewalld, sshd or
   NetworkManager was running when the guard was armed and has been stopped,

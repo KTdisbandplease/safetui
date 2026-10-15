@@ -11,7 +11,7 @@
 set -o pipefail
 
 APP_NAME="safetui"
-APP_VERSION="3.1.0"
+APP_VERSION="3.1.1"
 
 # ---------------------------------------------------------------------------
 # Language (i18n)
@@ -206,6 +206,17 @@ guard_ticker() {
         last="$GUARD_TXT"
         sleep 1
     done
+}
+# The ticker runs in a background copy of this shell, so it keeps the language it was started with.
+# Restart it whenever the language changes.
+start_ticker() {
+    guard_ticker </dev/null >/dev/null 2>&1 &
+    TICKER_PID=$!
+}
+restart_ticker() {
+    [[ -n "$TICKER_PID" ]] && kill "$TICKER_PID" 2>/dev/null
+    wait "$TICKER_PID" 2>/dev/null
+    start_ticker
 }
 
 # ---------------------------------------------------------------------------
@@ -2319,6 +2330,7 @@ lang_menu() {
         ko) LANG_MODE="ko"; save_lang ;;
         en) LANG_MODE="en"; save_lang ;;
     esac
+    restart_ticker
     BACKTITLE="safetui ${APP_VERSION} — $(L '방화벽·SELinux·작업 안전장치·백업' 'Firewall·SELinux·Guard·Backup')"
 }
 
@@ -2400,6 +2412,5 @@ esac
 BACKTITLE="safetui ${APP_VERSION} — $(L '방화벽·SELinux·작업 안전장치·백업' 'Firewall·SELinux·Guard·Backup')"
 need_root
 preflight
-guard_ticker </dev/null >/dev/null 2>&1 &
-TICKER_PID=$!
+start_ticker
 main_menu
