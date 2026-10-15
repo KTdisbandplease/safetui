@@ -11,7 +11,7 @@
 set -o pipefail
 
 APP_NAME="safetui"
-APP_VERSION="3.2.1"
+APP_VERSION="3.2.2"
 
 # ---------------------------------------------------------------------------
 # Language (i18n)
@@ -1539,6 +1539,10 @@ bk_browse() {
 # --- run a file / folder backup ----------------------------------------------
 # $1=source. Puts a result line in BK_MSG and returns 0=ok 1=failed 2=skipped 3=stop all.
 # cp -a preserves owner, group, mode, timestamps and SELinux label.
+# 실패 사유 문구. bk_dir_safe 는 "무엇이 문제인지" 다음 줄에 "어떻게 하면 되는지"를 함께 내므로
+# 첫 줄만 보여 주면 해결 방법이 잘린다. 두 줄까지 결과 화면의 들여쓰기에 맞춰 돌려준다.
+bk_err_text() { awk 'NR<=2 { printf "%s%s", (NR > 1 ? "\\n        " : ""), $0 }' "$TMP_DIR/cp.err"; }
+
 bk_copy_one() {
     local src="$1" base destdir dest part policy n a b lnk ldir
     base="$(basename "$src")"
@@ -1549,7 +1553,7 @@ bk_copy_one() {
     fi
     if ! bk_dir_safe "$destdir" >"$TMP_DIR/cp.err" || ! ( umask 077; mkdir -p -- "$destdir" ) 2>>"$TMP_DIR/cp.err" \
          || ! bk_dir_safe "$destdir" >"$TMP_DIR/cp.err"; then
-        BK_MSG="$(L '실패' 'FAILED')  $src\n        $(head -n 1 "$TMP_DIR/cp.err")"; return 1
+        BK_MSG="$(L '실패' 'FAILED')  $src\n        $(bk_err_text)"; return 1
     fi
     dest="${destdir%/}/${base}${BK_SFX}"
     if [[ "$dest" == "$src" ]]; then
@@ -1584,7 +1588,7 @@ bk_copy_one() {
     rm -rf -- "$part"
     if ! cp -a -- "$src" "$part" 2>"$TMP_DIR/cp.err"; then
         rm -rf -- "$part"
-        BK_MSG="$(L '실패' 'FAILED')  $src\n        $(head -n 1 "$TMP_DIR/cp.err")"; return 1
+        BK_MSG="$(L '실패' 'FAILED')  $src\n        $(bk_err_text)"; return 1
     fi
     # Links are not backed up, so remove them. Removing changes the folder mtime, so restore it from the source
     if [[ -d "$part" ]]; then
@@ -1597,7 +1601,7 @@ bk_copy_one() {
     if [[ -e "$dest" || -L "$dest" ]]; then rm -rf -- "$dest"; fi
     if ! mv -T -- "$part" "$dest" 2>"$TMP_DIR/cp.err"; then
         rm -rf -- "$part"
-        BK_MSG="$(L '실패' 'FAILED')  $src\n        $(head -n 1 "$TMP_DIR/cp.err")"; return 1
+        BK_MSG="$(L '실패' 'FAILED')  $src\n        $(bk_err_text)"; return 1
     fi
     BK_USED["$dest"]=1
     a="$(stat -c '%U:%G %a' -- "$src" 2>/dev/null)"; b="$(stat -c '%U:%G %a' -- "$dest" 2>/dev/null)"
@@ -1629,7 +1633,7 @@ bk_tar_all() {
     done
     if ! bk_dir_safe "$destdir" >"$TMP_DIR/cp.err" || ! ( umask 077; mkdir -p -- "$destdir" ) 2>>"$TMP_DIR/cp.err" \
          || ! bk_dir_safe "$destdir" >"$TMP_DIR/cp.err"; then
-        BK_MSG="$(L '실패' 'FAILED')  $(L 'tar 묶음' 'tar bundle')\n        $(head -n 1 "$TMP_DIR/cp.err")"; return 1
+        BK_MSG="$(L '실패' 'FAILED')  $(L 'tar 묶음' 'tar bundle')\n        $(bk_err_text)"; return 1
     fi
     dest="${destdir%/}/backup${BK_SFX}.tar"
     if [[ -e "$dest" || -L "$dest" ]]; then
@@ -1657,11 +1661,11 @@ bk_tar_all() {
     n=$?
     if (( n > 1 )) || [[ ! -s "$part" ]]; then   # tar exit code 1 = a file changed while being read (warning), 2 or more = failure
         rm -f -- "$part"
-        BK_MSG="$(L '실패' 'FAILED')  $(L 'tar 묶음' 'tar bundle')\n        $(head -n 1 "$TMP_DIR/cp.err")"; return 1
+        BK_MSG="$(L '실패' 'FAILED')  $(L 'tar 묶음' 'tar bundle')\n        $(bk_err_text)"; return 1
     fi
     if ! mv -f -T -- "$part" "$dest" 2>"$TMP_DIR/cp.err"; then
         rm -f -- "$part"
-        BK_MSG="$(L '실패' 'FAILED')  $(L 'tar 묶음' 'tar bundle')\n        $(head -n 1 "$TMP_DIR/cp.err")"; return 1
+        BK_MSG="$(L '실패' 'FAILED')  $(L 'tar 묶음' 'tar bundle')\n        $(bk_err_text)"; return 1
     fi
     cnt="$(tar -tf "$dest" 2>/dev/null | wc -l)"
     bk_hsize "$(stat -c %s -- "$dest" 2>/dev/null || echo 0)"

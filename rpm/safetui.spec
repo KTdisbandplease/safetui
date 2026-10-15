@@ -1,5 +1,5 @@
 Name:           safetui
-Version:        3.2.1
+Version:        3.2.2
 Release:        1%{?dist}
 Summary:        Menu-driven firewall, SELinux, lockout guard and backup tool
 
@@ -79,6 +79,11 @@ fi
 %dir %attr(0700,root,root) %{_sharedstatedir}/safetui-guard
 
 %changelog
+* Thu Oct 15 2026 JJ <mrwhitehacker@naver.com> - 3.2.2-1
+- Backup failure screens show the hint line as well, so when a backup folder is
+  refused (created by another account, or a symbolic link on the path) the fix
+  is on screen instead of only the reason
+
 * Thu Oct 15 2026 JJ <mrwhitehacker@naver.com> - 3.2.1-1
 - Backups now default to /var/backups/safetui instead of /tmp
   (the OS deletes old files under /tmp, and on a tmpfs /tmp they are lost on reboot)
