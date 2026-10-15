@@ -11,7 +11,7 @@
 set -o pipefail
 
 APP_NAME="safetui"
-APP_VERSION="3.1.1"
+APP_VERSION="3.1.2"
 
 # ---------------------------------------------------------------------------
 # Language (i18n)
@@ -293,7 +293,12 @@ fw_overview() {
 }
 
 # --- input validation ---
-valid_port()   { [[ "$1" =~ ^[0-9]{1,5}(-[0-9]{1,5})?$ ]]; }
+# 1-65535, or a range whose start is not above its end
+valid_port() {
+    [[ "$1" =~ ^([0-9]{1,5})(-([0-9]{1,5}))?$ ]] || return 1
+    local a=$(( 10#${BASH_REMATCH[1]} )) b=$(( 10#${BASH_REMATCH[3]:-${BASH_REMATCH[1]}} ))
+    (( a >= 1 && b <= 65535 && a <= b ))
+}
 valid_ipcidr() { [[ "$1" =~ ^[0-9A-Fa-f:.]+(/[0-9]{1,3})?$ ]]; }
 
 # --- warning before a change that can cut the remote session ---
@@ -1098,8 +1103,12 @@ declare -A BK_USED=()   # backup paths already created in this run
 bk_load() { bk_load_file "$VENDOR_DEFAULTS"; bk_load_file "$BK_CONF"; }
 bk_load_file() {
     [[ -r "$1" ]] || return 0
-    local k v
-    while IFS='=' read -r k v; do
+    local line k v
+    # Split at the first '=' only. (read with IFS='=' dropped a single trailing '=',
+    # so a password such as "abc=" was loaded as "abc" and the DB login failed.)
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" == *=* ]] || continue
+        k="${line%%=*}"; v="${line#*=}"
         case "$k" in
             DB_HOME)      BK_DB_HOME="$v" ;;
             DB_USER)      BK_DB_USER="$v" ;;

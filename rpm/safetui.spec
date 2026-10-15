@@ -1,5 +1,5 @@
 Name:           safetui
-Version:        3.1.1
+Version:        3.1.2
 Release:        1%{?dist}
 Summary:        Menu-driven firewall, SELinux, lockout guard and backup tool
 
@@ -79,6 +79,24 @@ fi
 %dir %attr(0700,root,root) %{_sharedstatedir}/safetui-guard
 
 %changelog
+* Thu Oct 15 2026 JJ <mrwhitehacker@naver.com> - 3.1.2-1
+- Lockout guard, network rollback: bring back only the connections that were
+  active when the guard was armed, each on its own device. Before, every profile
+  was activated, so an unused second profile of the same interface could take it
+  over and leave the server on the wrong address
+- Restart NetworkManager only when one of those connections does not come back,
+  not whenever any unrelated device is disconnected
+- Read nmcli output in English, so device states are recognised on servers
+  running in another language
+- Lockout guard without firewalld: the saved nftables ruleset now replaces the
+  current one on rollback instead of being added on top of it (duplicate rules)
+- safetui-guard arm: reject a missing option value (it used to loop forever),
+  unknown targets (a typo armed a guard that protected nothing) and a timeout
+  outside 30-86400 seconds
+- Port input: only 1-65535, and a range must not be reversed
+- Backup settings: a value ending in a single "=" (e.g. a generated DB password)
+  lost that "=" when the settings were read back, so DB backups failed to log in
+
 * Thu Oct 15 2026 JJ <mrwhitehacker@naver.com> - 3.1.1-1
 - Fix: after switching the language in the menu, the lockout guard countdown
   at the top right kept showing the previous language until safetui was restarted

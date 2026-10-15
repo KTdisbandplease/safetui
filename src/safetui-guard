@@ -54,6 +54,9 @@ notify() {
     return 0
 }
 
+# nmcli prints device states in the system language ("연결됨" on a Korean server), so always ask in English
+nm() { LC_ALL=C nmcli "$@"; }
+
 timer_active() { systemctl is-active --quiet "${UNIT}.timer" 2>/dev/null; }
 has_target() { [[ ",$1," == *",$2,"* || ",$1," == *",all,"* ]]; }
 
@@ -91,6 +94,34 @@ svc_revive() {
     return 0
 }
 
+# nm_restore_active <file of UUID:DEVICE lines>
+# Re-apply each recorded connection on its device; activate it there if something else is up instead.
+nm_restore_active() {
+    local u d
+    while IFS=: read -r u d; do
+        [[ -z "$u" || "$d" == lo ]] && continue
+        if nm -t -f UUID,DEVICE connection show --active 2>/dev/null | grep -qxF "$u:$d"; then
+            nm device reapply "$d" >/dev/null 2>&1 || nm connection up uuid "$u" ifname "$d" >/dev/null 2>&1
+        elif [[ -n "$d" ]]; then
+            # a virtual device (bond, vlan, dummy...) disappears when its connection goes down: then no ifname
+            nm connection up uuid "$u" ifname "$d" >/dev/null 2>&1 || nm connection up uuid "$u" >/dev/null 2>&1
+        else
+            nm connection up uuid "$u" >/dev/null 2>&1
+        fi
+    done < "$1"
+    return 0
+}
+# nm_all_back <file>: true when every recorded connection is active again on its device
+nm_all_back() {
+    local u d now
+    now="$(nm -t -f UUID,DEVICE connection show --active 2>/dev/null)"
+    while IFS=: read -r u d; do
+        [[ -z "$u" || "$d" == lo ]] && continue
+        grep -qxF "$u:$d" <<<"$now" || return 1
+    done < "$1"
+    return 0
+}
+
 # --------------------------------------------------------------------------
 # snapshot <targets-csv>
 snapshot() {
@@ -114,6 +145,9 @@ snapshot() {
         svc_record NetworkManager
         [[ -d /etc/NetworkManager/system-connections ]] && \
             cp -a /etc/NetworkManager/system-connections "$ACTIVE/nm-connections"
+        # Which connection was active on which device, so a rollback brings back exactly these
+        # (and not another profile of the same device that happened to be inactive)
+        nm -t -f UUID,DEVICE connection show --active 2>/dev/null > "$ACTIVE/nm-active"
     fi
     chmod -R go-rwx "$ACTIVE" 2>/dev/null
 }
@@ -146,7 +180,9 @@ do_rollback() {
         svc_revive "$dir" firewalld
         firewall-cmd --complete-reload 2>/dev/null && log "$(L 'firewalld 영구설정 복구 + reload' 'firewalld permanent config restored + reload')"
     elif [[ -f "$dir/ruleset.nft" ]]; then
-        nft -f "$dir/ruleset.nft" 2>/dev/null && log "$(L 'nftables 룰셋 복구' 'nftables ruleset restored')"
+        # replace, do not merge: without the flush the saved rules were added on top of the current ones
+        { echo "flush ruleset"; cat "$dir/ruleset.nft"; } | nft -f - 2>/dev/null && \
+            log "$(L 'nftables 룰셋 복구' 'nftables ruleset restored')"
     fi
 
     # restore NetworkManager - restore the files and really re-apply them (reactivate)
@@ -156,26 +192,43 @@ do_rollback() {
         svc_revive "$dir" NetworkManager
         command -v restorecon >/dev/null 2>&1 && \
             restorecon -R /etc/NetworkManager/system-connections 2>/dev/null
-        nmcli connection reload 2>/dev/null
-        local _dev
-        for _dev in $(nmcli -t -f DEVICE,STATE device status 2>/dev/null \
-                      | awk -F: '$2=="disconnected"{print $1}'); do
-            nmcli device connect "$_dev" 2>/dev/null
-        done
-        local _n _a _d
-        while IFS=: read -r _n _a _d; do
-            [[ -z "$_n" ]] && continue
-            if [[ "$_a" == "yes" && -n "$_d" ]]; then
-                nmcli device reapply "$_d" 2>/dev/null || nmcli connection up "$_n" 2>/dev/null
-            else
-                nmcli connection up "$_n" 2>/dev/null
-            fi
-        done < <(nmcli -t -f NAME,ACTIVE,DEVICE connection show 2>/dev/null)
-        systemctl is-active --quiet firewalld && firewall-cmd --reload >/dev/null 2>&1
-        if nmcli -t -f DEVICE,STATE device status 2>/dev/null | grep -qE ':(disconnected|unavailable)$'; then
-            systemctl restart NetworkManager >/dev/null 2>&1
-            sleep 2
+        nm connection reload 2>/dev/null
+        if [[ -s "$dir/nm-active" ]]; then
+            # Bring back only the connections that were active at arm time, each on its own device
+            nm_restore_active "$dir/nm-active"
             systemctl is-active --quiet firewalld && firewall-cmd --reload >/dev/null 2>&1
+            if ! nm_all_back "$dir/nm-active"; then
+                # still not back: restart NetworkManager once and try again
+                systemctl restart NetworkManager >/dev/null 2>&1
+                sleep 3
+                nm_restore_active "$dir/nm-active"
+                systemctl is-active --quiet firewalld && firewall-cmd --reload >/dev/null 2>&1
+            fi
+            nm_all_back "$dir/nm-active" || \
+                log "$(L '경고: 켤 때 활성이던 연결 중 다시 올라오지 않은 것이 있음 — nmcli connection show 확인' \
+                         'warning: some connections that were active at arm time did not come back — check nmcli connection show')"
+        else
+            # Snapshot from an older version (no record of active connections): previous behaviour
+            local _dev
+            for _dev in $(nm -t -f DEVICE,STATE device status 2>/dev/null \
+                          | awk -F: '$2=="disconnected"{print $1}'); do
+                nm device connect "$_dev" 2>/dev/null
+            done
+            local _n _a _d
+            while IFS=: read -r _n _a _d; do
+                [[ -z "$_n" ]] && continue
+                if [[ "$_a" == "yes" && -n "$_d" ]]; then
+                    nm device reapply "$_d" 2>/dev/null || nm connection up "$_n" 2>/dev/null
+                else
+                    nm connection up "$_n" 2>/dev/null
+                fi
+            done < <(nm -t -f NAME,ACTIVE,DEVICE connection show 2>/dev/null)
+            systemctl is-active --quiet firewalld && firewall-cmd --reload >/dev/null 2>&1
+            if nm -t -f DEVICE,STATE device status 2>/dev/null | grep -qE ':(disconnected|unavailable)$'; then
+                systemctl restart NetworkManager >/dev/null 2>&1
+                sleep 2
+                systemctl is-active --quiet firewalld && firewall-cmd --reload >/dev/null 2>&1
+            fi
         fi
         log "$(L 'NetworkManager 연결 복구 + 재적용 + 존 재바인딩' 'NetworkManager connections restored + reapplied + zone rebound')"
     fi
@@ -234,10 +287,33 @@ cmd_arm() {
     local timeout="$DEFAULT_TIMEOUT" note="" targets="all"
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --timeout) timeout="$2"; shift 2;;
-            --note)    note="$2"; shift 2;;
-            --targets) targets="$2"; shift 2;;
-            *) shift;;
+            --timeout|--note|--targets)
+                if [[ $# -lt 2 ]]; then
+                    echo "$(L "$1 다음에 값이 필요합니다." "$1 needs a value.")" >&2; return 2
+                fi
+                case "$1" in
+                    --timeout) timeout="$2";;
+                    --note)    note="$2";;
+                    --targets) targets="$2";;
+                esac
+                shift 2;;
+            *) echo "$(L "알 수 없는 옵션: $1" "unknown option: $1")" >&2; return 2;;
+        esac
+    done
+    if ! [[ "$timeout" =~ ^[0-9]+$ ]] || (( 10#$timeout < 30 || 10#$timeout > 86400 )); then
+        echo "$(L "--timeout 은 30 ~ 86400 (초) 사이의 숫자여야 합니다: $timeout" "--timeout must be a number of seconds from 30 to 86400: $timeout")" >&2
+        return 2
+    fi
+    timeout=$(( 10#$timeout ))
+    # Only known targets. A typo used to arm a guard that protected nothing.
+    local _t
+    targets="${targets// /}"
+    [[ -n "$targets" ]] || targets="all"
+    for _t in ${targets//,/ }; do
+        case "$_t" in
+            all|firewall|sshd|network) ;;
+            *) echo "$(L "알 수 없는 대상: $_t (firewall, sshd, network, all 중에서 쉼표로)" "unknown target: $_t (use firewall, sshd, network or all, comma separated)")" >&2
+               return 2;;
         esac
     done
     if timer_active; then
