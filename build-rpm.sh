@@ -11,7 +11,7 @@
 set -euo pipefail
 
 NAME=safetui
-VERSION=3.2.2
+VERSION=3.2.3
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 command -v rpmbuild >/dev/null 2>&1 || {

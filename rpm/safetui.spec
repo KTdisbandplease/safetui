@@ -1,5 +1,5 @@
 Name:           safetui
-Version:        3.2.2
+Version:        3.2.3
 Release:        1%{?dist}
 Summary:        Menu-driven firewall, SELinux, lockout guard and backup tool
 
@@ -79,6 +79,14 @@ fi
 %dir %attr(0700,root,root) %{_sharedstatedir}/safetui-guard
 
 %changelog
+* Mon Oct 19 2026 JJ <mrwhitehacker@naver.com> - 3.2.3-1
+- Scheduled DB backup: wait (up to 5 minutes) until the database answers before
+  dumping. When the server was off at the scheduled time, the catch-up run
+  right after boot started before MariaDB and failed with "Can't connect to
+  local server through socket"
+- The schedule unit is ordered after mariadb / mysqld when both start at boot;
+  existing schedules are rewritten on upgrade
+
 * Thu Oct 15 2026 JJ <mrwhitehacker@naver.com> - 3.2.2-1
 - Backup failure screens show the hint line as well, so when a backup folder is
   refused (created by another account, or a symbolic link on the path) the fix

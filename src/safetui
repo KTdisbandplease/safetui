@@ -11,7 +11,7 @@
 set -o pipefail
 
 APP_NAME="safetui"
-APP_VERSION="3.2.2"
+APP_VERSION="3.2.3"
 
 # ---------------------------------------------------------------------------
 # Language (i18n)
@@ -1885,6 +1885,32 @@ bk_db_run() {
 }
 
 # Entry point for the schedule (systemd timer) and the command line:  safetui --db-backup
+# Wait until the database answers (the scheduled run can start before MariaDB is up, e.g. the
+# catch-up run right after boot when the server was off at the scheduled time).
+# Uses mariadb-admin / mysqladmin ping, which succeeds as soon as the server is alive.
+# $1 = seconds to wait (default 300). No admin tool -> do not wait.
+bk_wait_db() {
+    local limit="${1:-300}" admin="" b waited=0 said=0
+    for b in "$BK_DB_HOME/bin/mariadb-admin" "$BK_DB_HOME/bin/mysqladmin"; do
+        [[ -x "$b" ]] && { admin="$b"; break; }
+    done
+    [[ -n "$admin" ]] || return 0
+    bk_write_cnf
+    while ! "$admin" --defaults-extra-file="$BK_CNF" --connect-timeout=5 ping >/dev/null 2>&1; do
+        if (( waited >= limit )); then
+            echo "safetui: $(L "DB 가 ${limit}초 동안 응답하지 않습니다" "the database did not answer for ${limit}s")" >&2
+            return 1
+        fi
+        if (( ! said )); then
+            echo "safetui: $(L 'DB 가 아직 응답하지 않아 기다립니다 (최대' 'waiting for the database to answer (up to') ${limit}$(L '초)' 's)')"
+            said=1
+        fi
+        sleep 10; (( waited += 10 ))
+    done
+    (( said )) && echo "safetui: $(L "DB 응답 확인 (${waited}초 기다림)" "database is up (waited ${waited}s)")"
+    return 0
+}
+
 bk_db_cli() {
     local f
     bk_load
@@ -1892,6 +1918,7 @@ bk_db_cli() {
         echo "safetui: $(L 'MariaDB 덤프 프로그램을 찾지 못했습니다' 'MariaDB dump program not found'): $BK_DB_HOME/bin/mariadb-dump" >&2
         return 1
     fi
+    bk_wait_db "${SAFETUI_DB_WAIT:-300}" || { echo "safetui: $(L 'DB 백업 실패 (기존 백업은 지우지 않음)' 'DB backup failed (existing backups kept)')" >&2; return 1; }
     if bk_db_run; then
         for f in "${BK_DB_MADE[@]}"; do echo "$(L 'DB 백업 완료' 'DB backup done'): $f ($(du -h -- "$f" 2>/dev/null | cut -f1))"; done
         (( BK_DB_KEEP_DAYS > 0 )) && echo "$(L '보관 기간이 지나 지운 백업' 'Expired backups removed'): $BK_DB_REMOVED"
@@ -2014,9 +2041,12 @@ bk_sched_apply() {
     cat >"$dir/$BK_UNIT.service" <<EOF
 [Unit]
 Description=safetui scheduled MariaDB backup (safetui --db-backup)
+# Start after the database when both start at boot. (safetui --db-backup also waits until it answers.)
+After=network-online.target mariadb.service mysqld.service mysql.service
 
 [Service]
 Type=oneshot
+TimeoutStartSec=infinity
 ExecStart=$self --db-backup
 Nice=19
 IOSchedulingClass=idle
