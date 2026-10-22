@@ -1,5 +1,5 @@
 Name:           safetui
-Version:        3.2.3
+Version:        3.3.0
 Release:        1%{?dist}
 Summary:        Menu-driven firewall, SELinux, lockout guard and backup tool
 
@@ -79,6 +79,21 @@ fi
 %dir %attr(0700,root,root) %{_sharedstatedir}/safetui-guard
 
 %changelog
+* Thu Oct 22 2026 JJ <mrwhitehacker@naver.com> - 3.3.0-1
+- Normal users can now run safetui without root. The menu then shows only what
+  works without privileges: file / DB backup, the schedule and read-only status.
+  Firewall and SELinux stay root-only - without root they answer "Authorization
+  failed", and a menu that can only fail is worse than no menu
+- A normal user keeps settings in ~/.config/safetui, backups in ~/safetui-backups
+  (mode 700), and falls back to those when the packaged defaults point at a
+  root-only folder
+- The schedule can run from crontab as well as a systemd timer. Root may pick
+  either; a normal user always gets crontab, because a per-user systemd timer
+  stops at logout unless lingering is enabled. Switching method removes the other
+  one, so the backup never runs twice
+- Scheduled runs go through a generated script (db-backup.sh); "last day of the
+  month" is handled there, since cron cannot express it
+
 * Mon Oct 19 2026 JJ <mrwhitehacker@naver.com> - 3.2.3-1
 - Scheduled DB backup: wait (up to 5 minutes) until the database answers before
   dumping. When the server was off at the scheduled time, the catch-up run

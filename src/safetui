@@ -11,12 +11,29 @@
 set -o pipefail
 
 APP_NAME="safetui"
-APP_VERSION="3.2.3"
+APP_VERSION="3.3.0"
+
+# ---------------------------------------------------------------------------
+# Run mode - root (everything) or user (backup and status only)
+#
+# Without root most menus cannot work at all: firewall-cmd --list-all answers
+# "Authorization failed", semanage is refused. Showing menus that only fail is
+# worse than not showing them, so a normal user gets the parts that do work:
+# file/DB backup, the schedule (systemd --user) and read-only status.
+# ---------------------------------------------------------------------------
+if [[ $EUID -eq 0 ]]; then
+    RUN_MODE="root"
+    CONF_DIR="/etc/safetui"
+else
+    RUN_MODE="user"
+    CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/safetui"
+fi
+user_mode() { [[ "$RUN_MODE" == user ]]; }
 
 # ---------------------------------------------------------------------------
 # Language (i18n)
 # ---------------------------------------------------------------------------
-LANG_FILE="/etc/safetui/lang"
+LANG_FILE="$CONF_DIR/lang"
 LANG_MODE="en"
 
 # Optional defaults file shipped by a package. key=value format.
@@ -90,14 +107,6 @@ export DIALOG_ESC=27
 # Common helpers
 # ---------------------------------------------------------------------------
 die() { echo "$(L '오류' 'Error'): $*" >&2; exit 1; }
-
-need_root() {
-    if [[ $EUID -ne 0 ]]; then
-        echo "$(L "이 도구는 root 권한이 필요합니다. 'sudo safetui' 로 실행하세요." \
-                "This tool requires root. Run 'sudo safetui'.")" >&2
-        exit 1
-    fi
-}
 
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
@@ -269,9 +278,14 @@ preflight() {
     need_cmd dialog || die "$(L "'dialog' 가 설치되어 있지 않습니다. (dnf install dialog)" \
                               "'dialog' is not installed. (dnf install dialog)")"
     local missing=()
-    need_cmd firewall-cmd || missing+=("firewalld")
-    need_cmd getenforce   || missing+=("libselinux-utils")
-    need_cmd semanage     || missing+=("policycoreutils-python-utils")
+    # A normal user never reaches the firewall / SELinux menus, so only check what they use.
+    if user_mode; then
+        need_cmd getenforce || missing+=("libselinux-utils")
+    else
+        need_cmd firewall-cmd || missing+=("firewalld")
+        need_cmd getenforce   || missing+=("libselinux-utils")
+        need_cmd semanage     || missing+=("policycoreutils-python-utils")
+    fi
     if [[ ${#missing[@]} -gt 0 ]]; then
         msg "$(L '구성요소 확인' 'Component check')" \
             "$(L '다음 패키지가 없어 일부 기능이 제한될 수 있습니다:' 'Some features may be limited; missing packages:')\n\n  ${missing[*]}\n\n$(L '설치' 'Install'):\n  dnf install ${missing[*]}"
@@ -1183,20 +1197,36 @@ guard_menu() {
 # ---------------------------------------------------------------------------
 # Backup - files and folders / MariaDB
 # ---------------------------------------------------------------------------
-BK_CONF="/etc/safetui/backup.conf"
-BK_HIST="/var/log/safetui-backup.log"   # file backup history (time<TAB>source<TAB>backup)
+BK_CONF="$CONF_DIR/backup.conf"
+# File backup history. root writes the system log; a normal user keeps their own
+# (they cannot write under /var/log).
+if user_mode; then
+    BK_HIST="$CONF_DIR/backup.log"
+else
+    BK_HIST="/var/log/safetui-backup.log"   # file backup history (time<TAB>source<TAB>backup)
+fi
+
+# Where backups go by default. A normal user cannot write under /var/backups,
+# so their backups live in their own home.
+if user_mode; then
+    BK_BASE="$HOME/safetui-backups"
+else
+    BK_BASE="/var/backups/safetui"
+fi
 
 # Default settings (bk_load overrides them when backup.conf exists)
 BK_DB_HOME="/usr"                         # MariaDB install path (bin/mariadb-dump under it is used)
-BK_DB_USER="root"
+# As root the unix_socket login works, so "root" is right. A normal user cannot use it
+# (Access denied for 'root'@'localhost'), so start from their own name instead.
+if user_mode; then BK_DB_USER="$USER"; else BK_DB_USER="root"; fi
 BK_DB_PASS=""                             # empty = connect without a password
 BK_DB_NAME=""                             # empty = all databases
-BK_DB_DIR="/var/backups/safetui/db"       # where DB dumps are stored
+BK_DB_DIR="$BK_BASE/db"                   # where DB dumps are stored
                                           # (not under /tmp: systemd-tmpfiles deletes old files there,
                                           #  and on a tmpfs /tmp the backups would vanish on reboot)
 BK_DB_KEEP_DAYS="30"                      # 0 = never delete
 BK_DEST_MODE="same"                       # same = next to the original, dir = BK_DEST_DIR
-BK_DEST_DIR="/var/backups/safetui/files"
+BK_DEST_DIR="$BK_BASE/files"
 BK_SUFFIX='_$today'                       # $today → YYYYMMDD, $time → HHMMSS
 BK_EXISTS="ask"                           # ask | number | overwrite | skip
 BK_DB_COMPRESS="yes"                      # yes = .sql.gz, no = .sql
@@ -1206,6 +1236,13 @@ BK_SCHED_DOW="Mon"                        # weekday for weekly (Mon..Sun)
 BK_SCHED_DOM="1"                          # day for monthly (1-28) or last (last day of the month)
 BK_SCHED_TIME="03:00"                     # time of day HH:MM
 BK_UNIT="safetui-dbbackup"               # systemd unit name of the scheduled backup
+# How the schedule is run: a systemd timer or the user's crontab.
+# A per-user systemd timer stops at logout unless lingering is on, so a normal user
+# always gets crontab - cron runs whether or not anyone is logged in.
+if user_mode; then BK_SCHED_METHOD="cron"; else BK_SCHED_METHOD="systemd"; fi
+BK_CRON_BEGIN="# >>> safetui db backup >>>"
+BK_CRON_END="# <<< safetui db backup <<<"
+BK_CRON_SH="$CONF_DIR/db-backup.sh"       # generated runner that cron calls
 
 # Allowed database names: letters, digits, _ - $, several separated by single spaces.
 # Keep it in a variable in single quotes: written straight into [[ =~ ]] the shell expands "$-"
@@ -1217,7 +1254,27 @@ declare -A BK_USED=()   # backup paths already created in this run
 
 # The settings file is never executed; it is read line by line (key=value) - safe even with special characters in the password
 # Read package defaults first, then the settings saved by the user (the later one wins)
-bk_load() { bk_load_file "$VENDOR_DEFAULTS"; bk_load_file "$BK_CONF"; }
+# The package defaults file is world-readable (0644), so a password put there would be
+# visible to every account on the server. It is never read from there - the password
+# belongs in each account's own settings file, which is created mode 0600.
+bk_load() { BK_NO_SECRET=1 bk_load_file "$VENDOR_DEFAULTS"; bk_load_file "$BK_CONF"; bk_usable_paths; }
+
+# The package defaults point at root-only folders (/var/backups/safetui, or whatever the
+# site set). A normal user cannot write there, and the dump used to fail halfway with a
+# bare "Permission denied". Fall back to their own folder instead.
+bk_writable_dir() {
+    local d="$1"
+    [[ -n "$d" ]] || return 1
+    while [[ ! -e "$d" ]]; do d="$(dirname -- "$d")"; [[ "$d" == "/" ]] && break; done
+    [[ -d "$d" && -w "$d" ]]
+}
+bk_usable_paths() {
+    # A per-user systemd timer dies at logout; never let a saved file bring it back.
+    user_mode && BK_SCHED_METHOD="cron"
+    user_mode || return 0
+    bk_writable_dir "$BK_DB_DIR"   || BK_DB_DIR="$BK_BASE/db"
+    bk_writable_dir "$BK_DEST_DIR" || BK_DEST_DIR="$BK_BASE/files"
+}
 bk_load_file() {
     [[ -r "$1" ]] || return 0
     local line k v
@@ -1229,7 +1286,10 @@ bk_load_file() {
         case "$k" in
             DB_HOME)      BK_DB_HOME="$v" ;;
             DB_USER)      BK_DB_USER="$v" ;;
-            DB_PASS)      BK_DB_PASS="$v" ;;
+            DB_PASS)      if [[ -n "${BK_NO_SECRET:-}" ]]; then
+                              echo "$(date '+%F %T') $(L 'DB_PASS 는 공용 기본값 파일에서 읽지 않습니다' \
+                                                         'DB_PASS is ignored in the shared defaults file'): $1" >>"$TMP_DIR/notes" 2>/dev/null
+                          else BK_DB_PASS="$v"; fi ;;
             # 메뉴 입력과 같은 형식 검사. 설정 파일을 손으로 고쳤을 때 이상한 값이 그대로 쓰이지 않게.
             DB_NAME)      [[ -z "$v" || "$v" =~ $BK_DBNAME_RE ]] && BK_DB_NAME="$v" ;;
             DB_DIR)       BK_DB_DIR="$v" ;;
@@ -1244,6 +1304,7 @@ bk_load_file() {
             SCHED_DOW)    [[ "$v" =~ ^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)$ ]] && BK_SCHED_DOW="$v" ;;
             SCHED_DOM)    [[ "$v" =~ ^([1-9]|1[0-9]|2[0-8]|last)$ ]] && BK_SCHED_DOM="$v" ;;
             SCHED_TIME)   [[ "$v" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] && BK_SCHED_TIME="$v" ;;
+            SCHED_METHOD) [[ "$v" =~ ^(systemd|cron)$ ]] && BK_SCHED_METHOD="$v" ;;
         esac
     done <"$1"
 }
@@ -1304,6 +1365,8 @@ bk_save() {
         printf 'SCHED_DOW=%s\n'    "$BK_SCHED_DOW"
         printf 'SCHED_DOM=%s\n'    "$BK_SCHED_DOM"
         printf 'SCHED_TIME=%s\n'   "$BK_SCHED_TIME"
+        printf 'SCHED_METHOD=%s
+' "$BK_SCHED_METHOD"
     } >"$tmp"
     mv -f "$tmp" "$BK_CONF"
 }
@@ -1982,6 +2045,9 @@ bk_dow_label() {
         Sun) L '일요일' 'Sunday' ;;
     esac
 }
+bk_sched_method_label() {
+    if [[ "$BK_SCHED_METHOD" == cron ]]; then L '크론탭' 'crontab'; else L 'systemd 타이머' 'systemd timer'; fi
+}
 bk_sched_label() {
     case "$BK_SCHED" in
         daily)   echo "$(L '매일' 'Every day') $BK_SCHED_TIME" ;;
@@ -2003,28 +2069,143 @@ bk_sched_calendar() {
 # Is this file safe to run from a systemd unit as root? (root-owned, not writable by group/others,
 # and every folder above it the same). Used for the ExecStart path of the schedule.
 bk_path_trusted() {
+    # Every directory up to / must be owned by someone we trust and must not be
+    # writable by others. As root that means root only. A normal user also trusts
+    # directories they own themselves (their home), but never one a third user owns.
     local p="$1" owner mode
     [[ -n "$p" && -x "$p" && ! -L "$p" ]] || return 1
     while :; do
         owner="$(stat -c %u -- "$p" 2>/dev/null)" || return 1
         mode="$(stat -c %a -- "$p" 2>/dev/null)"
-        [[ "$owner" == 0 ]] || return 1
+        if user_mode; then
+            [[ "$owner" == 0 || "$owner" == "$EUID" ]] || return 1
+        else
+            [[ "$owner" == 0 ]] || return 1
+        fi
         (( 8#${mode:-0} & 8#0022 )) && return 1
         [[ "$p" == "/" ]] && return 0
         p="$(dirname "$p")"
     done
 }
 
+# The schedule runs in the system scope as root, and in the per-user scope otherwise.
+# A normal user cannot write /etc/systemd/system, but "systemctl --user" is theirs.
+sctl() { if user_mode; then systemctl --user "$@"; else systemctl "$@"; fi; }
+jctl() { if user_mode; then journalctl --user "$@"; else journalctl "$@"; fi; }
+sysd_dir() { if user_mode; then echo "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"; else echo "/etc/systemd/system"; fi; }
+
+# ---------------------------------------------------------------------------
+# Schedule by crontab
+#
+# cron runs no matter who is logged in, which a per-user systemd timer does not.
+# The crontab line calls a small generated script rather than safetui directly, so
+# that PATH / language are fixed and the output always lands in one log file.
+# ---------------------------------------------------------------------------
+# Can this account use crontab at all? (cron.allow / cron.deny decide it)
+bk_cron_ok() {
+    need_cmd crontab || return 1
+    local err
+    err="$(crontab -l 2>&1 >/dev/null)"
+    # "no crontab for <user>" just means it is empty - that is fine
+    [[ "$err" == *"not allowed"* || "$err" == *"ot permitted"* ]] && return 1
+    return 0
+}
+
+# Cron time fields for the current settings. Monthly "last day" has no cron syntax,
+# so it runs every day and the script itself skips every day but the last.
+bk_cron_spec() {
+    local hh="${BK_SCHED_TIME%%:*}" mm="${BK_SCHED_TIME##*:}"
+    hh="$((10#$hh))"; mm="$((10#$mm))"
+    case "$BK_SCHED" in
+        daily)   printf '%d %d * * *\n' "$mm" "$hh" ;;
+        weekly)  printf '%d %d * * %s\n' "$mm" "$hh" "$BK_SCHED_DOW" ;;
+        monthly) if [[ "$BK_SCHED_DOM" == last ]]; then printf '%d %d * * *\n' "$mm" "$hh"
+                 else printf '%d %d %d * *\n' "$mm" "$hh" "$((10#$BK_SCHED_DOM))"; fi ;;
+    esac
+}
+
+# The script cron calls. Deleting old backups is safetui's own job (--db-backup
+# removes the ones past the retention period only after a successful run).
+bk_cron_write_script() {
+    local self="$1" guard=""
+    [[ "$BK_SCHED" == monthly && "$BK_SCHED_DOM" == last ]] && guard='
+# Only on the last day of the month (tomorrow is the 1st)
+[ "$(date -d tomorrow +%d)" = "01" ] || exit 0'
+    mkdir -p -- "$(dirname -- "$BK_CRON_SH")" 2>/dev/null
+    cat >"$BK_CRON_SH" <<EOS
+#!/bin/bash
+# Generated by safetui ${APP_VERSION}. Edited by hand? The next schedule change overwrites it.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export SAFETUI_LANG=${LANG_MODE}${guard}
+exec >>"${BK_CRON_SH%.sh}.log" 2>&1
+echo "--- \$(date '+%Y-%m-%d %H:%M:%S') ---"
+${self} --db-backup
+EOS
+    chmod 700 "$BK_CRON_SH"
+}
+
+# Replace our block in the crontab (keeping every other line untouched)
+bk_cron_apply() {
+    local self="$1" spec cur
+    spec="$(bk_cron_spec)" || return 1
+    bk_cron_write_script "$self" || return 1
+    cur="$(crontab -l 2>/dev/null | sed "\|^${BK_CRON_BEGIN}\$|,\|^${BK_CRON_END}\$|d")"
+    { [[ -n "$cur" ]] && printf '%s\n' "$cur"
+      printf '%s\n' "$BK_CRON_BEGIN"
+      printf '%s %s\n' "$spec" "$BK_CRON_SH"
+      printf '%s\n' "$BK_CRON_END"; } | crontab - 2>"$TMP_OUT" || return 1
+    return 0
+}
+
+bk_cron_remove() {
+    need_cmd crontab || return 0
+    local cur
+    cur="$(crontab -l 2>/dev/null | sed "\|^${BK_CRON_BEGIN}\$|,\|^${BK_CRON_END}\$|d")"
+    if [[ -z "${cur//[[:space:]]/}" ]]; then crontab -r 2>/dev/null
+    else printf '%s\n' "$cur" | crontab - 2>/dev/null; fi
+    rm -f -- "$BK_CRON_SH"
+    return 0
+}
+
+bk_cron_active() { crontab -l 2>/dev/null | grep -qF "$BK_CRON_SH"; }
+
+# cron does not report a next run, so work it out from the settings.
+bk_cron_next_text() {
+    local now d
+    now="$(date +%s)"
+    case "$BK_SCHED" in
+        daily)
+            d="$(date +%Y-%m-%d) $BK_SCHED_TIME"
+            (( $(date -d "$d" +%s 2>/dev/null || echo 0) <= now )) && d="tomorrow $BK_SCHED_TIME" ;;
+        weekly)
+            d="$BK_SCHED_DOW $BK_SCHED_TIME"
+            (( $(date -d "$d" +%s 2>/dev/null || echo 0) <= now )) && d="next $BK_SCHED_DOW $BK_SCHED_TIME" ;;
+        monthly)
+            if [[ "$BK_SCHED_DOM" == last ]]; then
+                d="$(date -d "$(date +%Y-%m-01) +1 month -1 day" +%Y-%m-%d) $BK_SCHED_TIME"
+                (( $(date -d "$d" +%s 2>/dev/null || echo 0) <= now )) && d="$(date -d "$(date +%Y-%m-01) +2 month -1 day" +%Y-%m-%d) $BK_SCHED_TIME"
+            else
+                d="$(printf '%s-%02d' "$(date +%Y-%m)" "$((10#$BK_SCHED_DOM))") $BK_SCHED_TIME"
+                (( $(date -d "$d" +%s 2>/dev/null || echo 0) <= now )) && d="$(printf '%s-%02d' "$(date -d "$(date +%Y-%m-01) +1 month" +%Y-%m)" "$((10#$BK_SCHED_DOM))") $BK_SCHED_TIME"
+            fi ;;
+        *) L '(예약 없음)' '(not scheduled)'; return ;;
+    esac
+    date -d "$d" '+%Y-%m-%d %H:%M (%a)' 2>/dev/null || echo "$BK_SCHED_TIME"
+}
+
 # Apply the current BK_SCHED* settings to systemd (remove the units when off)
 bk_sched_apply() {
-    local dir="/etc/systemd/system" cal self
+    local dir cal self
+    dir="$(sysd_dir)"
     cal="$(bk_sched_calendar)"
-    if [[ -z "$cal" ]]; then
-        systemctl disable --now "$BK_UNIT.timer" >/dev/null 2>&1
-        rm -f "$dir/$BK_UNIT.timer" "$dir/$BK_UNIT.service"
-        systemctl daemon-reload >/dev/null 2>&1
-        return 0
-    fi
+    # Turning it off, or switching method, must clear BOTH kinds - otherwise the old
+    # one keeps firing and the backup runs twice.
+    sctl disable --now "$BK_UNIT.timer" >/dev/null 2>&1
+    rm -f "$dir/$BK_UNIT.timer" "$dir/$BK_UNIT.service"
+    sctl daemon-reload >/dev/null 2>&1
+    bk_cron_remove
+    [[ -z "$cal" ]] && return 0
+    mkdir -p "$dir" 2>/dev/null
     # 예약은 root 로 실행되므로 ExecStart 에 아무 경로나 넣으면 안 된다.
     # 설치본(/usr/bin/safetui)을 우선 쓰고, 없을 때만 지금 실행 중인 파일을 쓰되
     # root 소유 + 남이 쓸 수 없는 경우에만 허용한다 (/tmp 등에서 복사해 돌린 파일이 박히는 것 방지).
@@ -2038,6 +2219,15 @@ bk_sched_apply() {
             return 1
         fi
     fi
+    if [[ "$BK_SCHED_METHOD" == cron ]]; then
+        if ! bk_cron_ok; then
+            echo "$(L '이 계정은 crontab 을 쓸 수 없습니다 (/etc/cron.allow · cron.deny 확인 필요).'                      'This account may not use crontab (check /etc/cron.allow and cron.deny).')" >"$TMP_OUT"
+            return 1
+        fi
+        bk_cron_apply "$self" || return 1
+        return 0
+    fi
+
     cat >"$dir/$BK_UNIT.service" <<EOF
 [Unit]
 Description=safetui scheduled MariaDB backup (safetui --db-backup)
@@ -2065,20 +2255,35 @@ WantedBy=timers.target
 EOF
     chmod 644 "$dir/$BK_UNIT.service" "$dir/$BK_UNIT.timer"
     restorecon "$dir/$BK_UNIT.service" "$dir/$BK_UNIT.timer" >/dev/null 2>&1
-    systemctl daemon-reload >/dev/null 2>&1
-    systemctl enable "$BK_UNIT.timer" >/dev/null 2>&1
-    systemctl restart "$BK_UNIT.timer" 2>"$TMP_OUT"
+    sctl daemon-reload >/dev/null 2>&1
+    sctl enable "$BK_UNIT.timer" >/dev/null 2>&1
+    sctl restart "$BK_UNIT.timer" 2>"$TMP_OUT"
+    # A per-user timer only runs while the user has a session, unless lingering is on.
+    if user_mode && ! loginctl show-user "$USER" -p Linger --value 2>/dev/null | grep -qi yes; then
+        echo "$(L '참고: 로그아웃하면 예약이 멈춥니다. 계속 돌리려면 관리자에게 아래를 요청하세요.'                  'Note: the schedule stops when you log out. To keep it running, ask an admin for:')" >>"$TMP_OUT"
+        echo "  sudo loginctl enable-linger $USER" >>"$TMP_OUT"
+    fi
 }
 bk_sched_next() {
     local v
-    systemctl is-active --quiet "$BK_UNIT.timer" 2>/dev/null || { L '(예약 없음)' '(not scheduled)'; return; }
-    v="$(systemctl show "$BK_UNIT.timer" -p NextElapseUSecRealtime --value 2>/dev/null)"
+    if [[ "$BK_SCHED_METHOD" == cron ]]; then
+        bk_cron_active || { L '(예약 없음)' '(not scheduled)'; return; }
+        # cron cannot tell us; work it out from the settings
+        bk_cron_next_text; return
+    fi
+    sctl is-active --quiet "$BK_UNIT.timer" 2>/dev/null || { L '(예약 없음)' '(not scheduled)'; return; }
+    v="$(sctl show "$BK_UNIT.timer" -p NextElapseUSecRealtime --value 2>/dev/null)"
     [[ -n "$v" && "$v" != "n/a" ]] && date -d "$v" '+%Y-%m-%d %H:%M (%a)' 2>/dev/null || echo "${v:-?}"
 }
 bk_sched_last() {
     local ts res
-    ts="$(systemctl show "$BK_UNIT.service" -p ExecMainExitTimestamp --value 2>/dev/null)"
-    res="$(systemctl show "$BK_UNIT.service" -p Result --value 2>/dev/null)"
+    if [[ "$BK_SCHED_METHOD" == cron ]]; then
+        ts="$(date -r "${BK_CRON_SH%.sh}.log" '+%Y-%m-%d %H:%M' 2>/dev/null)"
+        [[ -n "$ts" ]] && echo "$ts" || L '(없음)' '(none)'
+        return
+    fi
+    ts="$(sctl show "$BK_UNIT.service" -p ExecMainExitTimestamp --value 2>/dev/null)"
+    res="$(sctl show "$BK_UNIT.service" -p Result --value 2>/dev/null)"
     if [[ -z "$ts" || "$ts" == "n/a" ]]; then L '(아직 실행된 적 없음)' '(never run)'; return; fi
     if [[ "$res" == success ]]; then echo "$(L '성공' 'OK') — $(date -d "$ts" '+%Y-%m-%d %H:%M' 2>/dev/null)"
     else echo "$(L '실패' 'FAILED') ($res) — $(date -d "$ts" '+%Y-%m-%d %H:%M' 2>/dev/null)"; fi
@@ -2086,7 +2291,11 @@ bk_sched_last() {
 bk_sched_log_text() {
     echo "$(L '자동 백업 실행 기록 (최근 것이 위)' 'Scheduled backup log (newest first)')"
     echo
-    journalctl -u "$BK_UNIT.service" -n 40 -r --no-pager -o short-iso 2>&1 | sed 's/^\([0-9-]*\)T\([0-9:]*\)[^ ]* [^ ]* /\1 \2 /'
+    if [[ "$BK_SCHED_METHOD" == cron ]]; then
+        tail -n 200 "${BK_CRON_SH%.sh}.log" 2>/dev/null || L '(아직 실행 기록이 없습니다)' '(no runs yet)'
+        return
+    fi
+    jctl -u "$BK_UNIT.service" -n 40 -r --no-pager -o short-iso 2>&1 | sed 's/^\([0-9-]*\)T\([0-9:]*\)[^ ]* [^ ]* /\1 \2 /'
 }
 
 bk_sched() {
@@ -2094,16 +2303,34 @@ bk_sched() {
     bk_load
     while true; do
         choice="$(dlg --title "$(L 'DB 자동 백업 예약' 'Scheduled DB backup')" --cancel-label "$(L '뒤로' 'Back')" \
-            --menu "$(L '정해 둔 시각에 DB 백업을 자동으로 실행합니다. (safetui 를 켜 둘 필요 없음)' 'Runs the DB backup automatically at the set time. (safetui need not stay open)')\n\n$(L '현재 예약   :' 'Schedule :') $(bk_sched_label)\n$(L '다음 실행   :' 'Next run :') $(bk_sched_next)\n$(L '마지막 실행 :' 'Last run :') $(bk_sched_last)" \
+            --menu "$(L '정해 둔 시각에 DB 백업을 자동으로 실행합니다. (safetui 를 켜 둘 필요 없음)' 'Runs the DB backup automatically at the set time. (safetui need not stay open)')\n\n$(L '현재 예약   :' 'Schedule :') $(bk_sched_label)\n$(L '다음 실행   :' 'Next run :') $(bk_sched_next)\n$(L '마지막 실행 :' 'Last run :') $(bk_sched_last)\n$(L '실행 방식   :' 'Run by   :') $(bk_sched_method_label)" \
             "$DLG_H" "$DLG_W" 6 \
             1 "$(L '매일' 'Every day')" \
             2 "$(L '매주 (요일 선택)' 'Every week (pick a weekday)')" \
             3 "$(L '매월 (날짜 또는 말일)' 'Every month (a day or the last day)')" \
             4 "$(L '예약 끄기' 'Turn schedule off')" \
-            5 "$(L '실행 기록 보기' 'View run log')")" || return
+            5 "$(L '실행 기록 보기' 'View run log')" \
+            6 "$(L '실행 방식 바꾸기 (systemd / 크론)' 'Change how it runs (systemd / cron)')")" || return
         case "$choice" in
             5) show_text "$(L '자동 백업 실행 기록' 'Scheduled backup log')" bk_sched_log_text; continue ;;
-            4) if [[ "$BK_SCHED" == off ]] && ! systemctl is-enabled --quiet "$BK_UNIT.timer" 2>/dev/null; then
+            6) if user_mode; then
+                   msg "$(L '실행 방식' 'How it runs')" "$(L '일반 사용자 모드에서는 크론탭만 씁니다.' 'In normal-user mode only crontab is used.')\n\n$(L 'systemd 의 사용자 타이머는 로그아웃하면 멈추기 때문입니다. 크론은 로그인 여부와 상관없이 돕니다.' 'A per-user systemd timer stops when you log out; cron runs regardless.')" 11
+                   continue
+               fi
+               v="$(dlg --title "$(L '실행 방식' 'How it runs')" --default-item "$BK_SCHED_METHOD" \
+                    --menu "$(L '예약을 무엇으로 실행할까요?' 'What should run the schedule?')" 13 "$DLG_W" 2 \
+                    systemd "$(L 'systemd 타이머 — 놓친 시각을 부팅 후 따라잡음' 'systemd timer - catches up a missed run after boot')" \
+                    cron    "$(L '크론탭 — 어디서나 익숙한 방식, 놓친 시각은 넘어감' 'crontab - familiar everywhere, a missed run is skipped')")" || continue
+               BK_SCHED_METHOD="$v"; bk_save
+               if [[ "$BK_SCHED" != off ]]; then
+                   if bk_sched_apply; then
+                       msg "$(L '실행 방식 — 변경됨' 'How it runs - changed')" "$(L '예약을 새 방식으로 다시 등록했습니다.' 'The schedule was re-registered with the new method.')\n\n$(L '실행 방식 :' 'Run by   :') $(bk_sched_method_label)\n$(L '다음 실행 :' 'Next run :') $(bk_sched_next)" 10
+                   else
+                       msg "$(L '실행 방식 — 실패' 'How it runs - failed')" "$(cat "$TMP_OUT")" 12
+                   fi
+               fi
+               continue ;;
+            4) if [[ "$BK_SCHED" == off ]] && ! bk_cron_active                   && ! sctl is-enabled --quiet "$BK_UNIT.timer" 2>/dev/null; then
                    msg "$(L 'DB 자동 백업 예약' 'Scheduled DB backup')" "$(L '예약이 이미 꺼져 있습니다.' 'The schedule is already off.')" 7; continue
                fi
                BK_SCHED="off"; bk_save; bk_sched_apply
@@ -2135,7 +2362,7 @@ bk_sched() {
         BK_SCHED_TIME="$v"
         case "$choice" in 1) BK_SCHED="daily" ;; 2) BK_SCHED="weekly" ;; 3) BK_SCHED="monthly" ;; esac
         bk_save
-        if bk_sched_apply && systemctl is-active --quiet "$BK_UNIT.timer"; then
+        if bk_sched_apply && { [[ "$BK_SCHED_METHOD" == cron ]] && bk_cron_active                                || { [[ "$BK_SCHED_METHOD" != cron ]] && sctl is-active --quiet "$BK_UNIT.timer"; }; }; then
             BK_DUMP="$(bk_dump_bin)" || v="\n\n$(L '[주의] 지금 설정된 경로에서 MariaDB 를 찾지 못했습니다. 백업 설정을 확인하세요.' '[CAUTION] MariaDB was not found under the configured path. Check Backup settings.')"
             [[ -n "${BK_DUMP:-}" ]] && v=""
             msg "$(L '예약 — 성공' 'Schedule — OK')" \
@@ -2528,6 +2755,34 @@ lang_menu() {
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+# Read-only status. Everything here works without root.
+status_menu() {
+    local c
+    while true; do
+        c="$(dlg --title "$(L '상태 보기' 'Status')" --cancel-label "$(L '뒤로' 'Back')"             --menu "$(L '읽기만 합니다. 아무것도 바꾸지 않습니다.' 'Read-only. Nothing is changed.')" 15 "$DLG_W" 4             1 "$(L 'SELinux 상태' 'SELinux status')"             2 "$(L 'SELinux 설정값(boolean) 목록' 'SELinux booleans')"             3 "$(L '실행 중인 서비스' 'Running services')"             4 "$(L '디스크 여유 공간' 'Disk space')")" || return 0
+        case "$c" in
+            1) show_text "$(L 'SELinux 상태' 'SELinux status')" bash -c                  'echo "getenforce: $(getenforce 2>&1)"; echo; sestatus 2>&1 || true' ;;
+            2) show_text "$(L 'SELinux 설정값(boolean)' 'SELinux booleans')" bash -c 'getsebool -a 2>&1' ;;
+            3) show_text "$(L '실행 중인 서비스' 'Running services')" bash -c                  'systemctl list-units --type=service --state=running --no-pager --no-legend 2>&1' ;;
+            4) show_text "$(L '디스크 여유 공간' 'Disk space')" bash -c 'df -hT -x tmpfs -x devtmpfs 2>&1' ;;
+        esac
+    done
+}
+
+# Menu for a normal user: only what works without root.
+user_main_menu() {
+    local c
+    while true; do
+        c="$(dlg --title "$(L '메인 메뉴' 'Main menu')" --cancel-label "$(L '종료' 'Quit')"             --menu "$(L '일반 사용자 모드입니다. 관리 기능은 sudo safetui 로 실행하세요.'                        'Normal-user mode. For the admin features run: sudo safetui')" 15 "$DLG_W" 4             1 "$(L '백업' 'Backup')"             2 "$(L '상태 보기' 'Status')"             3 "$(L '언어 변경 / Language' 'Language')"             4 "$(L '정보 / 도움말' 'About / Help')")" || return 0
+        case "$c" in
+            1) backup_menu ;;
+            2) status_menu ;;
+            3) lang_menu ;;
+            4) info_menu ;;
+        esac
+    done
+}
+
 main_menu() {
     local rc fails=0 defbtn=ok
     while true; do
@@ -2577,9 +2832,9 @@ main_menu() {
 # ---- entrypoint ----
 case "${1:-}" in
     -v|--version) echo "${APP_NAME} ${APP_VERSION}"; exit 0 ;;
-    --db-backup)  need_root; bk_db_cli; exit $? ;;
+    --db-backup)  bk_db_cli; exit $? ;;
     --apply-schedule)   # re-register the saved schedule in systemd (called by the package scriptlet after a package swap)
-        need_root; bk_load; bk_sched_apply; exit 0 ;;
+        bk_load; bk_sched_apply; exit 0 ;;
     -e|--en|--english) LANG_MODE="en"; save_lang; shift ;;
     -k|--ko|--korean)  LANG_MODE="ko"; save_lang; shift ;;
     -h|--help)
@@ -2587,7 +2842,8 @@ case "${1:-}" in
 ${APP_NAME} ${APP_VERSION} — Firewall / SELinux management TUI
 
 Usage:
-  sudo ${APP_NAME}            run the menu
+  sudo ${APP_NAME}            run the menu (firewall, SELinux, guard, backup)
+  ${APP_NAME}                 run as a normal user (backup and status only)
   sudo ${APP_NAME} --english  switch to English (persists)
   sudo ${APP_NAME} --korean   switch to Korean (persists)
   ${APP_NAME} --version       show version
@@ -2595,13 +2851,17 @@ Usage:
   ${APP_NAME} --help          this help
 
 Language can also be set via SAFETUI_LANG=en|ko, or the in-app Language menu.
-Target: RHEL / Rocky / AlmaLinux 9. Requires root.
+Target: RHEL / Rocky / AlmaLinux 9.
+Root is needed for firewall / SELinux / guard. Backup and status work without it.
 EOF
         exit 0 ;;
 esac
 
-BACKTITLE="safetui ${APP_VERSION} — $(L '방화벽·SELinux·작업 안전장치·백업' 'Firewall·SELinux·Guard·Backup')"
-need_root
+if user_mode; then
+    BACKTITLE="safetui ${APP_VERSION} — $(L '백업·상태 보기 (일반 사용자)' 'Backup·Status (normal user)')"
+else
+    BACKTITLE="safetui ${APP_VERSION} — $(L '방화벽·SELinux·작업 안전장치·백업' 'Firewall·SELinux·Guard·Backup')"
+fi
 preflight
 start_ticker
-main_menu
+if user_mode; then user_main_menu; else main_menu; fi

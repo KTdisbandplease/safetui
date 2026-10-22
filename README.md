@@ -4,7 +4,8 @@ A terminal menu (TUI) for everyday server work on RHEL / Rocky Linux / AlmaLinux
 **firewall, SELinux, a lockout guard with automatic rollback, and backups** — all from
 one screen, without having to remember the commands.
 
-- Target: **RHEL / Rocky Linux / AlmaLinux 9**, run as root (`sudo safetui`)
+- Target: **RHEL / Rocky Linux / AlmaLinux 9**. Run as root (`sudo safetui`) for the
+  full menu; a normal user gets **backup and read-only status** (see below)
 - Languages: **English** (default) and **Korean** — switch from the main menu, or
   `safetui --english` / `safetui --korean`
 - Pure shell scripts on top of `dialog` / `whiptail`. No daemon, no open port.
@@ -122,17 +123,39 @@ sudo safetui-guard ok                    # confirm, keep the change
 sudo safetui-guard status                # also: rollback, log
 ```
 
+## Running without root
+
+`safetui` also runs as a normal user. The menu then offers only what works
+without privileges — **Backup** and **Status** (read-only). Firewall, SELinux and
+the lockout guard stay root-only: without root `firewall-cmd` answers
+*Authorization failed*, and a menu that can only fail is worse than no menu.
+
+| | root | normal user |
+|---|---|---|
+| Settings | `/etc/safetui/` | `~/.config/safetui/` |
+| Backups | `/var/backups/safetui/` | `~/safetui-backups/` (mode 700) |
+| Default DB user | `root` (unix_socket) | the login name |
+| Schedule | systemd timer or crontab | crontab only |
+
+A per-user systemd timer stops when the user logs out, so a normal user always
+gets crontab. An account that may not use crontab (`/etc/cron.allow`,
+`/etc/cron.deny`) cannot schedule a backup, and is told so.
+
 ## Backup settings
 
-Stored in `/etc/safetui/backup.conf` (root only, mode 600). Change them from
-**Backup > Backup settings**.
+Stored in `/etc/safetui/backup.conf`, or `~/.config/safetui/backup.conf` for a
+normal user (mode 600, owner only). Change them from **Backup > Backup settings**.
+
+The password is never read from the packaged defaults file
+(`/usr/share/safetui/defaults.conf`): that file is world-readable, so a password
+left there would be visible to every account on the server.
 
 | Setting | Default | Notes |
 |---|---|---|
 | DB install path | `/usr` | `bin/mariadb-dump` under this path is used |
-| DB user / password | `root` / none | the password is optional |
+| DB user / password | `root` / none | the password is optional; a normal user defaults to their login name |
 | Database name | all databases | several names separated by spaces |
-| DB backup folder | `/var/backups/safetui/db` | created root-only (700) |
+| DB backup folder | `/var/backups/safetui/db` | created owner-only (700); a normal user gets `~/safetui-backups/db` |
 | DB backup retention | 30 days | 0 = keep forever |
 | DB backup gzip | on | off saves plain `.sql` |
 | File backup folder | same folder as the original | or one folder for everything (`/var/backups/safetui/files`) |
