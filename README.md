@@ -9,6 +9,9 @@ one screen, without having to remember the commands.
 - Languages: **English** (default) and **Korean** — switch from the main menu, or
   `safetui --english` / `safetui --korean`
 - Pure shell scripts on top of `dialog` / `whiptail`. No daemon, no open port.
+- Two screen styles, chosen from the **Screen** menu: the classic dialog windows,
+  or screens drawn by safetui with a one-line description under each item and a
+  settable accent colour. Classic is the default.
 
 <p align="center">
   <img src="docs/screenshots/main.png" alt="safetui main menu" width="640">
@@ -140,6 +143,11 @@ the lockout guard stay root-only: without root `firewall-cmd` answers
 A per-user systemd timer stops when the user logs out, so a normal user always
 gets crontab. An account that may not use crontab (`/etc/cron.allow`,
 `/etc/cron.deny`) cannot schedule a backup, and is told so.
+
+A normal user can only back up files and folders they own. Being able to read a
+file is not enough: `cp` copies a world-readable system file just fine, and the
+copy would then belong to whoever ran the backup. Such entries are shown but
+marked "not yours" and cannot be selected.
 
 ## Backup settings
 

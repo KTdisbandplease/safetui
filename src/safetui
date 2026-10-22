@@ -11,7 +11,11 @@
 set -o pipefail
 
 APP_NAME="safetui"
-APP_VERSION="3.3.0"
+APP_VERSION="3.4.0"
+
+# Screen widths are counted in characters. Under LC_ALL=C bash counts bytes instead,
+# which makes every Korean line ragged, so make sure we are in a UTF-8 locale.
+[[ "${LC_ALL:-${LANG:-}}" == *UTF-8* ]] || export LC_ALL=C.UTF-8
 
 # ---------------------------------------------------------------------------
 # Run mode - root (everything) or user (backup and status only)
@@ -90,6 +94,7 @@ TICKER_PID=""     # background process that shows the guard countdown
 cleanup() {
     [[ -n "$TICKER_PID" ]] && kill "$TICKER_PID" 2>/dev/null
     rm -rf "$TMP_DIR"
+    ui_exit
     [[ -t 1 ]] && clear 2>/dev/null
     [[ -n "$EXIT_NOTE" ]] && echo "$EXIT_NOTE" >&2
     return 0
@@ -159,11 +164,478 @@ tui_resizable() {
     if [[ -n "$old_int" ]]; then eval "$old_int"; else trap - INT; fi
     return "$rc"
 }
-dialog()   { tui_resizable dialog "$@"; }
+# Every dialog call goes through here, so the modern style is applied to the
+# screens that are not built by dlg() / msg() / yesno() either - long output
+# (--textbox) and the "please wait" boxes (--infobox). The widgets that have no
+# hand-drawn equivalent yet (file browser, checklist, progress bars) keep using
+# dialog itself.
+dialog() {
+    if modern; then
+        local i title="" kind="" arg=""
+        local -a a=("$@")
+        for (( i=0; i<${#a[@]}; i++ )); do
+            case "${a[i]}" in
+                --title)   title="${a[i+1]}" ;;
+                --textbox) kind=text; arg="${a[i+1]}" ;;
+                --infobox) kind=info; arg="${a[i+1]}" ;;
+            esac
+        done
+        case "$kind" in
+            text) ui_pager "$title" "$arg"; return 0 ;;
+            info) ui_info  "${title:-safetui}" "$arg"; return 0 ;;
+        esac
+    fi
+    tui_resizable dialog "$@"
+}
 whiptail() { tui_resizable whiptail "$@"; }
 
+# ---------------------------------------------------------------------------
+# Screen style - "classic" (dialog, as before) or "modern" (drawn here)
+#
+# The modern screens are drawn with plain escape codes, so nothing extra has to
+# be installed. dlg() / msg() / yesno() pick the style, which is why none of the
+# callers had to change.
+#
+# Everything is drawn on fd 3, which points at the terminal. dlg() is called
+# inside $( ), so anything written to stdout would be swallowed as the result
+# instead of appearing on screen. (dialog solves this by drawing on stderr.)
+# Only the chosen value goes to stdout.
+# ---------------------------------------------------------------------------
+UI_FILE="$CONF_DIR/ui"
+UI_STYLE="classic"
+UI_ACCENT="orange"
+
+ui_accent_code() {
+    case "${1:-$UI_ACCENT}" in
+        orange) echo 215 ;; sky) echo 117 ;; green) echo 114 ;;
+        purple) echo 141 ;; pink) echo 211 ;; yellow) echo 222 ;; *) echo 215 ;;
+    esac
+}
+ui_accent_label() {
+    case "${1:-$UI_ACCENT}" in
+        orange) L '주황' 'Orange' ;; sky) L '하늘' 'Sky' ;; green) L '초록' 'Green' ;;
+        purple) L '보라' 'Purple' ;; pink) L '분홍' 'Pink' ;; yellow) L '노랑' 'Yellow' ;;
+    esac
+}
+ui_load() {
+    [[ -r "$UI_FILE" ]] || return 0
+    local k v
+    while IFS='=' read -r k v; do
+        case "$k" in
+            STYLE)  [[ "$v" =~ ^(classic|modern)$ ]] && UI_STYLE="$v" ;;
+            ACCENT) [[ "$v" =~ ^(orange|sky|green|purple|pink|yellow)$ ]] && UI_ACCENT="$v" ;;
+        esac
+    done <"$UI_FILE"
+}
+ui_save() {
+    mkdir -p -- "$(dirname -- "$UI_FILE")" 2>/dev/null
+    { printf 'STYLE=%s\n' "$UI_STYLE"; printf 'ACCENT=%s\n' "$UI_ACCENT"; } >"$UI_FILE"
+}
+modern() { [[ "$UI_STYLE" == modern ]]; }
+
+ui_init_colors() {
+    # fd 3 is where every screen is drawn. Careful with the redirection here:
+    # writing it as `exec 3>/dev/tty 2>/dev/null` also sends the script's own
+    # stderr to /dev/null for good, and dialog draws on stderr - the classic
+    # screens then showed nothing at all.
+    if [[ -w /dev/tty ]]; then exec 3>/dev/tty; else exec 3>&2; fi
+    local a; a="$(ui_accent_code)"
+    UI_R=$'\033[0m'; UI_B=$'\033[1m'; UI_D=$'\033[2m'
+    UI_LINE=$'\033[38;5;240m'; UI_MUT=$'\033[38;5;245m'
+    UI_ACC=$'\033[38;5;'"$a"'m'
+    UI_OK=$'\033[38;5;114m'; UI_WARN=$'\033[38;5;209m'
+}
+
+# Width in columns, left in UI_W. Hangul and CJK take two, everything else we
+# use takes one; colour codes take none and are stepped over.
+#
+# The same rows are measured again on every redraw, so the answer is kept and
+# looked up next time - walking each string character by character once per
+# keypress was most of what made the screens feel slow. The result must not be
+# printed: $( ) would fork, and the remembered answers would be lost with the
+# subshell that computed them.
+declare -A UI_WC=()
+ui_w() {
+    local s="$1" i=0 c cp n=0 len
+    # An empty subscript is not allowed in an associative array, and blank rows
+    # (the spacer lines) are measured all the time.
+    if [[ -z "$s" ]]; then UI_W=0; return 0; fi
+    n="${UI_WC[$s]-}"
+    if [[ -n "$n" ]]; then UI_W=$n; return 0; fi
+    len=${#s}; n=0
+    while (( i < len )); do
+        c="${s:i:1}"
+        if [[ "$c" == $'\033' ]]; then
+            (( i++ ))
+            while (( i < len )) && [[ "${s:i:1}" != m ]]; do (( i++ )); done
+            (( i++ )); continue
+        fi
+        printf -v cp '%d' "'$c" 2>/dev/null || cp=63
+        if (( (cp >= 0x1100 && cp <= 0x115F) || (cp >= 0x2E80 && cp <= 0xA4CF) \
+           || (cp >= 0xA960 && cp <= 0xA97F) || (cp >= 0xAC00 && cp <= 0xD7A3) \
+           || (cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0xFE30 && cp <= 0xFE4F) \
+           || (cp >= 0xFF00 && cp <= 0xFF60) || (cp >= 0xFFE0 && cp <= 0xFFE6) )); then
+            n=$(( n + 2 ))
+        else
+            n=$(( n + 1 ))
+        fi
+        (( i++ ))
+    done
+    (( ${#UI_WC[@]} > 3000 )) && UI_WC=()     # file names keep arriving; do not grow forever
+    UI_WC["$s"]=$n
+    UI_W=$n
+}
+
+# Terminal size. tput is a program, so it is read once and kept; a window that
+# is resized while a screen is open is picked up the next time one opens.
+UI_COLS=0
+UI_ROWS=0
+ui_size() {
+    UI_COLS=$(tput cols 2>/dev/null || echo 80); (( UI_COLS > 100 )) && UI_COLS=100; (( UI_COLS < 40 )) && UI_COLS=40
+    UI_ROWS=$(tput lines 2>/dev/null || echo 24); (( UI_ROWS < 12 )) && UI_ROWS=12
+}
+ui_cols()  { (( UI_COLS )) || ui_size; echo "$UI_COLS"; }
+ui_lines() { (( UI_ROWS )) || ui_size; echo "$UI_ROWS"; }
+
+# Drawing goes into one buffer and reaches the terminal as a single write.
+#
+# Two things made the screen flash on every keypress. Each frame started with
+# "clear the screen" (ESC[2J), so there was a blank moment before the new frame
+# arrived; and the frame left here a character at a time, which over ssh is a
+# lot of small writes the terminal paints as it receives them.
+#
+# Now the cursor is only sent home, each row erases what is left of its own line
+# (ESC[K), and anything below the last row is erased at the end (ESC[J). Nothing
+# is ever blank in between, so there is nothing to flicker.
+#
+# Nothing in here uses $( ): a command substitution forks a process, and with
+# twenty rows per frame that was twenty forks for every single keypress - which
+# is what made the file browser feel like it was lagging behind the keyboard.
+# Widths come back in UI_W and padding in UI_FILL instead.
+ui_frame() { UI_BUF=$'\033[H'; }
+ui_flush() { UI_BUF+=$'\033[J'; printf '%s' "$UI_BUF" >&3; }
+ui_put()   { UI_BUF+="$1"$'\033[K\n'; }
+ui_fill()  { printf -v UI_FILL '%*s' "$1" ''; UI_FILL="${UI_FILL// /$2}"; }
+
+# The border lines never change while the width does not, so build them once.
+UI_BW=0
+ui_border() {
+    (( UI_BW == $1 )) && return 0
+    UI_BW="$1"; ui_fill $(( $1 - 2 )) ─
+    UI_TOP="${UI_LINE}┌${UI_FILL}┐${UI_R}"
+    UI_SEP="${UI_LINE}├${UI_FILL}┤${UI_R}"
+    UI_BOT="${UI_LINE}└${UI_FILL}┘${UI_R}"
+}
+ui_top() { ui_border "$1"; ui_put "$UI_TOP"; }
+ui_sep() { ui_border "$1"; ui_put "$UI_SEP"; }
+ui_bot() { ui_border "$1"; ui_put "$UI_BOT"; }
+ui_row() {
+    local w="$1" t="$2" pad
+    ui_w "$t"
+    pad=$(( w - 3 - UI_W )); (( pad < 0 )) && pad=0
+    printf -v UI_FILL '%*s' "$pad" ''
+    ui_put "${UI_LINE}│${UI_R} ${t}${UI_FILL}${UI_LINE}│${UI_R}"
+}
+
+ui_head() {
+    ui_top "$1"
+    ui_row "$1" "${UI_ACC}${UI_B}safetui${UI_R}  ${UI_MUT}${APP_VERSION}${UI_R}   ${UI_D}|${UI_R}  $2"
+    ui_sep "$1"
+}
+# Body text. \n breaks a line the way dialog does, and anything still too wide
+# for the box is wrapped - a long sentence used to run straight through the
+# right border.
+ui_body() {
+    local w="$1" line word out
+    while IFS= read -r line; do
+        ui_w "$line"
+        if (( UI_W > w - 4 )); then
+            out=""
+            for word in $line; do
+                ui_w "$out $word"
+                if (( UI_W > w - 4 )); then ui_row "$w" "$out"; out="$word"
+                else [[ -n "$out" ]] && out="$out $word" || out="$word"; fi
+            done
+            [[ -n "$out" ]] && ui_row "$w" "$out"
+        else
+            ui_row "$w" "$line"
+        fi
+    done < <(printf '%b\n' "$2")
+}
+ui_mode_badge() { if user_mode; then L '일반 사용자' 'normal user'; else echo root; fi; }
+# The alternate screen is entered once, at start-up, and left in cleanup.
+#
+# It cannot be tracked with a variable: dlg() runs inside $( ), so a screen that
+# set a flag would set it in a subshell and the main shell would never know -
+# the terminal was then left on the alternate screen after safetui quit.
+# Entering and leaving around every screen is not an option either, that swap is
+# exactly what read as a flash. So the main shell does it, once, on each side.
+ui_begin() { modern && printf '\033[?1049h\033[?25l' >&3 2>/dev/null; return 0; }
+ui_exit()  { modern && printf '\033[?25h\033[?1049l' >&3 2>/dev/null; return 0; }
+ui_enter() { :; }                      # the screens themselves do neither
+ui_leave() { :; }
+
+# One keypress, arrow escapes decoded. Read from the terminal: stdin may be
+# something else entirely.
+ui_key() {
+    local k rest
+    IFS= read -rsn1 k </dev/tty || return 1
+    if [[ "$k" == $'\033' ]]; then
+        IFS= read -rsn2 -t 0.05 rest </dev/tty 2>/dev/null || true
+        case "$rest" in "[A") echo up ;; "[B") echo down ;; "[C") echo right ;; "[D") echo left ;;
+                        "") echo esc ;; *) echo other ;; esac
+        return 0
+    fi
+    case "$k" in
+        "") echo enter ;; q|Q) echo quit ;; $'\177'|$'\b') echo back ;;
+        *) printf 'ch:%s\n' "$k" ;;
+    esac
+}
+
+# --- menu ------------------------------------------------------------------
+# An item may carry a one-line description after a tab: "title<TAB>description".
+# Items without one simply show no second line.
+# Prints the chosen tag. 0 = chosen, 1 = quit, 255 = ESC.
+ui_menu() {
+    local title="$1" prompt="$2" cancel="$3"; shift 3
+    local -a tags=() names=() descs=()
+    while (( $# >= 2 )); do
+        tags+=("$1"); names+=("${2%%$'\t'*}")
+        if [[ "$2" == *$'\t'* ]]; then descs+=("${2#*$'\t'}"); else descs+=(""); fi
+        shift 2
+    done
+    local n=${#tags[@]} cur=0 w k i sub c
+    (( n )) || return 1
+    w="$(ui_cols)"
+    sub="${UI_MUT}$(ui_mode_badge)${UI_R}"
+    [[ -n "$title" ]] && sub="$sub   ${UI_D}|${UI_R}  ${UI_B}${title}${UI_R}"
+    ui_enter
+    while :; do
+        {
+            ui_frame
+            ui_head "$w" "$sub"
+            if [[ -n "$prompt" ]]; then ui_row "$w" "${UI_MUT}${prompt}${UI_R}"; ui_row "$w" ""; fi
+            for (( i=0; i<n; i++ )); do
+                if (( i == cur )); then
+                    ui_row "$w" "${UI_ACC}▌${UI_R} ${UI_B}${tags[i]}  ${names[i]}${UI_R}"
+                    [[ -n "${descs[i]}" ]] && ui_row "$w" "${UI_ACC}▌${UI_R}    ${UI_MUT}${descs[i]}${UI_R}"
+                else
+                    ui_row "$w" "${UI_D}│${UI_R} ${UI_MUT}${tags[i]}${UI_R}  ${names[i]}"
+                    [[ -n "${descs[i]}" ]] && ui_row "$w" "${UI_D}│${UI_R}    ${UI_D}${descs[i]}${UI_R}"
+                fi
+            done
+            ui_sep "$w"
+            ui_row "$w" "${UI_D}$(L '위/아래 이동    Enter 선택    Esc' 'up/down move    Enter choose    Esc') ${cancel}${UI_R}"
+            ui_bot "$w"
+        }
+        ui_flush
+        k="$(ui_key)" || k=esc
+        case "$k" in
+            up)    (( cur = (cur - 1 + n) % n )) ;;
+            down)  (( cur = (cur + 1) % n )) ;;
+            enter) ui_leave; printf '%s' "${tags[cur]}"; return 0 ;;
+            esc)   ui_leave; return 255 ;;
+            quit)  ui_leave; return 1 ;;
+            ch:*)  c="${k#ch:}"
+                   for (( i=0; i<n; i++ )); do
+                       if [[ "${tags[i]}" == "$c" ]]; then ui_leave; printf '%s' "$c"; return 0; fi
+                   done ;;
+        esac
+    done
+}
+
+
+# --- checklist -------------------------------------------------------------
+# Same arguments dialog uses: tag item status, repeated. Prints the chosen tags,
+# one per line (what --separate-output does), 0 = confirmed, 1/255 = cancelled.
+ui_checklist() {
+    local title="$1" prompt="$2"; shift 2
+    local -a tags=() names=() on=()
+    while (( $# >= 3 )); do
+        tags+=("$1"); names+=("$2")
+        if [[ "$3" == on ]]; then on+=(1); else on+=(0); fi
+        shift 3
+    done
+    local n=${#tags[@]} cur=0 w k i picked=0
+    (( n )) || return 1
+    w="$(ui_cols)"
+    ui_enter
+    while :; do
+        picked=0; for (( i=0; i<n; i++ )); do (( picked += on[i] )); done
+        {
+            ui_frame
+            ui_head "$w" "${UI_MUT}$(ui_mode_badge)${UI_R}   ${UI_D}|${UI_R}  ${UI_B}${title}${UI_R}"
+            ui_body "$w" "$prompt"
+            ui_row "$w" ""
+            for (( i=0; i<n; i++ )); do
+                local box="[ ]"; (( on[i] )) && box="${UI_OK}[x]${UI_R}"
+                if (( i == cur )); then
+                    ui_row "$w" "${UI_ACC}▌${UI_R} ${box} ${UI_B}${tags[i]}${UI_R}  ${UI_MUT}${names[i]}${UI_R}"
+                else
+                    ui_row "$w" "${UI_D}│${UI_R} ${box} ${tags[i]}  ${UI_D}${names[i]}${UI_R}"
+                fi
+            done
+            ui_sep "$w"
+            ui_row "$w" "${UI_D}$(L 'Space 선택/해제    Enter 확인    Esc 취소' 'Space toggle    Enter confirm    Esc cancel')   ${UI_R}${UI_ACC}${picked}${UI_R}${UI_D} $(L '개 선택됨' 'selected')${UI_R}"
+            ui_bot "$w"
+        }
+        ui_flush
+        k="$(ui_key)" || k=esc
+        case "$k" in
+            up)     (( cur = (cur - 1 + n) % n )) ;;
+            down)   (( cur = (cur + 1) % n )) ;;
+            "ch: ") on[cur]=$(( 1 - on[cur] )) ;;
+            enter)  ui_leave
+                    for (( i=0; i<n; i++ )); do (( on[i] )) && printf '%s\n' "${tags[i]}"; done
+                    return 0 ;;
+            esc|quit) ui_leave; return 1 ;;
+        esac
+    done
+}
+
+# --- message / confirm -----------------------------------------------------
+ui_msg() {
+    local title="$1" body="$2" w; w="$(ui_cols)"
+    ui_enter
+    {
+        ui_frame
+        ui_top "$w"; ui_row "$w" "${UI_ACC}${UI_B}${title}${UI_R}"; ui_sep "$w"
+        ui_body "$w" "$body"
+        ui_sep "$w"; ui_row "$w" "${UI_D}$(L 'Enter 또는 Esc 로 닫기' 'Enter or Esc to close')${UI_R}"; ui_bot "$w"
+    }
+    ui_flush
+    ui_key >/dev/null || true
+    ui_leave
+    return 0
+}
+ui_confirm() {
+    local title="$1" body="$2" w sel=0 k; w="$(ui_cols)"
+    ui_enter
+    while :; do
+        {
+            ui_frame
+            ui_top "$w"; ui_row "$w" "${UI_WARN}${UI_B}${title}${UI_R}"; ui_sep "$w"
+            ui_body "$w" "$body"
+            ui_sep "$w"
+            if (( sel == 0 )); then
+                ui_row "$w" "   ${UI_B}${UI_OK}[ $(L '예' 'Yes') ]${UI_R}      ${UI_D}[ $(L '아니오' 'No') ]${UI_R}"
+            else
+                ui_row "$w" "   ${UI_D}[ $(L '예' 'Yes') ]${UI_R}      ${UI_B}${UI_WARN}[ $(L '아니오' 'No') ]${UI_R}"
+            fi
+            ui_row "$w" "${UI_D}$(L '좌우 또는 위아래로 고르고 Enter' 'arrow keys to choose, then Enter')${UI_R}"
+            ui_bot "$w"
+        }
+        ui_flush
+        k="$(ui_key)" || k=esc
+        case "$k" in
+            up|down|left|right) (( sel = 1 - sel )) ;;
+            enter)     ui_leave; return "$sel" ;;
+            esc|quit)  ui_leave; return 1 ;;
+            ch:y|ch:Y) ui_leave; return 0 ;;
+            ch:n|ch:N) ui_leave; return 1 ;;
+        esac
+    done
+}
+
+
+# A box that appears and stays while something runs (no key is waited for).
+ui_info() {
+    local title="$1" body="$2" w; w="$(ui_cols)"
+    {
+        ui_frame
+        ui_top "$w"; ui_row "$w" "${UI_ACC}${UI_B}${title}${UI_R}"; ui_sep "$w"
+        ui_body "$w" "$body"
+        ui_bot "$w"
+    }
+    ui_flush
+}
+
+# Single-line editor. Prints the text, 0 = accepted, 1 = cancelled.
+# Enough for what safetui asks for (paths, ports, times): printable characters,
+# backspace, left / right / home / end.
+ui_input() {
+    local title="$1" prompt="$2" val="${3:-}" w k pos=${#3} c
+    w="$(ui_cols)"
+    ui_enter
+    while :; do
+        {
+            ui_frame
+            ui_head "$w" "${UI_MUT}$(ui_mode_badge)${UI_R}   ${UI_D}|${UI_R}  ${UI_B}${title}${UI_R}"
+            ui_body "$w" "$prompt"
+            ui_row "$w" ""
+            ui_row "$w" "${UI_ACC}>${UI_R} ${UI_B}${val:0:pos}${UI_R}${UI_ACC}_${UI_R}${UI_B}${val:pos}${UI_R}"
+            ui_sep "$w"
+            ui_row "$w" "${UI_D}$(L 'Enter 저장    Esc 취소    백스페이스 지우기' 'Enter save    Esc cancel    Backspace delete')${UI_R}"
+            ui_bot "$w"
+        }
+        ui_flush
+        k="$(ui_key)" || k=esc
+        case "$k" in
+            enter) ui_leave; printf '%s' "$val"; return 0 ;;
+            esc)   ui_leave; return 1 ;;
+            left)  (( pos > 0 )) && (( pos-- )) ;;
+            right) (( pos < ${#val} )) && (( pos++ )) ;;
+            back)  if (( pos > 0 )); then val="${val:0:pos-1}${val:pos}"; (( pos-- )); fi ;;
+            quit)  val="${val:0:pos}q${val:pos}"; (( pos++ )) ;;
+            ch:*)  c="${k#ch:}"; val="${val:0:pos}${c}${val:pos}"; (( pos++ )) ;;
+        esac
+    done
+}
+
+# --- scrolling text --------------------------------------------------------
+ui_pager() {
+    local title="$1" file="$2" w rows top=0 total k i
+    local -a page=()
+    w="$(ui_cols)"; rows=$(( $(ui_lines) - 6 )); (( rows < 5 )) && rows=5
+    mapfile -t page < <(fold -s -w $(( w - 4 )) -- "$file" 2>/dev/null)
+    total=${#page[@]}
+    ui_enter
+    while :; do
+        {
+            ui_frame
+            ui_top "$w"; ui_row "$w" "${UI_ACC}${UI_B}${title}${UI_R}"; ui_sep "$w"
+            for (( i=top; i<top+rows && i<total; i++ )); do ui_row "$w" "${page[i]}"; done
+            ui_sep "$w"
+            ui_row "$w" "${UI_D}$(L '위/아래 한 줄   Space 한 쪽   Esc 닫기' 'up/down line   Space page   Esc close')${UI_R}"
+            ui_bot "$w"
+        }
+        ui_flush
+        k="$(ui_key)" || k=esc
+        case "$k" in
+            down)   (( top + rows < total )) && (( top++ )) ;;
+            up)     (( top > 0 )) && (( top-- )) ;;
+            "ch: ") (( top + rows < total )) && (( top += rows )) ;;
+            esc|quit|enter) ui_leave; return 0 ;;
+        esac
+    done
+}
+
+# Takes dialog's own arguments, so every existing caller works unchanged. In the
+# modern style the --menu / --checklist arguments are read out and drawn here.
 dlg() {
     flush_input
+    if modern; then
+        local title="" cancel prompt="" kind=""
+        cancel="$(L '취소' 'Cancel')"
+        local -a rest=()
+        while (( $# )); do
+            case "$1" in
+                --title)          title="$2"; shift 2 ;;
+                --cancel-label)   cancel="$2"; shift 2 ;;
+                --default-item)   shift 2 ;;
+                --default-button) shift 2 ;;
+                --separate-output|--help-status|--extra-button|--help-button) shift ;;
+                --ok-label|--extra-label|--help-label) shift 2 ;;
+                --menu)           prompt="$2"; kind=menu;  shift 5 ;;   # text, height, width, count
+                --checklist)      prompt="$2"; kind=check; shift 5 ;;
+                *)                rest+=("$1"); shift ;;
+            esac
+        done
+        case "$kind" in
+            menu)  ui_menu "$title" "$(printf '%b' "$prompt" | head -n 1)" "$cancel" "${rest[@]}"; return $? ;;
+            check) ui_checklist "$title" "$prompt" "${rest[@]}"; return $? ;;
+        esac
+    fi
     dialog --backtitle "$BACKTITLE" \
         --ok-label "$(L '확인' 'OK')" --cancel-label "$(L '취소' 'Cancel')" "$@" 3>&1 1>&2 2>&3
 }
@@ -173,6 +645,10 @@ dlg() {
 # Enter activates it. (dialog cannot move with the arrow keys, so only input boxes use whiptail)
 dlg_input() {
     local title="$1" prompt="$2" def="${3:-}"
+    if modern; then
+        ui_input "$title" "$prompt" "$def"
+        return $?
+    fi
     local hint="$(L '[ ↑↓ 로 입력칸/확인/취소 이동, Enter 로 실행 ]' \
                     '[ Use up/down to move between field/OK/Cancel, Enter to activate ]')"
     # unlike dialog, whiptail does not interpret \n, so convert it to real line breaks
@@ -186,8 +662,16 @@ dlg_input() {
 }
 
 # --cr-wrap: keep line breaks of command output / --no-collapse: keep alignment spaces
-msg()  { flush_input; dialog --backtitle "$BACKTITLE" --ok-label "$(L '확인' 'OK')" --title "$1" --cr-wrap --no-collapse --msgbox "$2" "${3:-$DLG_H}" "${4:-$DLG_W}"; }
-yesno(){ flush_input; dialog --backtitle "$BACKTITLE" --yes-label "$(L '예' 'Yes')" --no-label "$(L '아니오' 'No')" --title "$1" --yesno "$2" "${3:-10}" "${4:-$DLG_W}"; }
+msg() {
+    flush_input
+    if modern; then ui_msg "$1" "$2"; return 0; fi
+    dialog --backtitle "$BACKTITLE" --ok-label "$(L '확인' 'OK')" --title "$1" --cr-wrap --no-collapse --msgbox "$2" "${3:-$DLG_H}" "${4:-$DLG_W}"
+}
+yesno() {
+    flush_input
+    if modern; then ui_confirm "$1" "$2"; return $?; fi
+    dialog --backtitle "$BACKTITLE" --yes-label "$(L '예' 'Yes')" --no-label "$(L '아니오' 'No')" --title "$1" --yesno "$2" "${3:-10}" "${4:-$DLG_W}"
+}
 
 # Run a command and show success / failure in a dialog.
 run_show() {
@@ -1365,8 +1849,7 @@ bk_save() {
         printf 'SCHED_DOW=%s\n'    "$BK_SCHED_DOW"
         printf 'SCHED_DOM=%s\n'    "$BK_SCHED_DOM"
         printf 'SCHED_TIME=%s\n'   "$BK_SCHED_TIME"
-        printf 'SCHED_METHOD=%s
-' "$BK_SCHED_METHOD"
+        printf 'SCHED_METHOD=%s\n' "$BK_SCHED_METHOD"
     } >"$tmp"
     mv -f "$tmp" "$BK_CONF"
 }
@@ -1509,8 +1992,133 @@ bk_sel_count() {
 # Arrow keys move, Space selects, Enter opens a folder. Selections are kept while moving between folders.
 # Symbolic links are not backed up, so they are not listed.
 # Returns: 0 = start the backup, 1 = cancel
+# May this account back this path up?
+#
+# As root, anything. As a normal user, only what they own. Readable is not
+# enough: cp copies a world-readable system file just fine, and the copy then
+# belongs to whoever ran the backup - a quiet way to end up with /etc files
+# sitting in someone's home. Folders they do not own stay listed so they can
+# still walk through them (/home is root's, and their own folder is inside it),
+# they simply cannot be picked.
+bk_may_select() {
+    user_mode || return 0
+    local owner
+    owner="$(stat -c %u -- "$1" 2>/dev/null)" || return 1
+    [[ "$owner" == "$EUID" ]]
+}
+bk_not_mine_text() {
+    L '내 것이 아닌 파일·폴더는 백업할 수 없습니다. 읽을 수 있더라도, 복사본이 내 소유로 바뀌기 때문입니다.\n관리자에게 요청하거나 sudo safetui 로 실행하세요.' \
+      'You can only back up what you own. Even when a file is readable, the copy would end up owned by you.\nAsk an administrator, or run: sudo safetui'
+}
+
+
+# The file browser, drawn by safetui. Same job as the dialog one: walk folders,
+# mark what to back up. Selections live in BK_SEL, shared with the classic
+# screen, so switching style mid-way keeps them.
+bk_browse_modern() {
+    local cur="$1" k w i=0 idx n top=0 rows full note="" denied=0
+    local typ size mt own mode name info mark lock path me
+    me="$(id -un)"
+    local -a tags names owned
+    local listed="" badge hint_up hint_keys hint_sel title_sel nsel sp
+    w="$(ui_cols)"; rows=$(( $(ui_lines) - 12 )); (( rows < 5 )) && rows=5
+    badge="$(ui_mode_badge)"
+    hint_up="$(L '[ 상위 폴더로 ]' '[ parent folder ]')"
+    hint_keys="$(L 'Space 선택   Enter 폴더 열기   b 백업 시작   g 경로 입력   Esc 취소' 'Space select   Enter open   b back up   g go to path   Esc cancel')"
+    hint_sel="$(L '개 선택됨' 'selected')"
+    title_sel="$(L '백업할 파일·폴더 선택' 'Select files and folders')"
+    ui_enter
+    while :; do
+      # Reading the folder again on every keypress is what made moving the
+      # cursor feel slow; the listing only changes when the folder does.
+      if [[ "$listed" != "$cur" ]]; then
+        listed="$cur"
+        tags=(); names=(); owned=()
+        if [[ "$cur" != "/" ]]; then tags+=(".."); names+=("$hint_up"); owned+=(1); fi
+        while IFS=$'\t' read -r -d '' typ size mt own mode name; do
+            full="${cur%/}/$name"
+            if [[ "$typ" == d ]]; then
+                tags+=("$name/"); printf -v info '%6s  %-10s %4s  %s' '<DIR>' "$own" "$mode" "$mt"
+            else
+                tags+=("$name"); bk_hsize "$size"; printf -v info '%6s  %-10s %4s  %s' "$REPLY" "$own" "$mode" "$mt"
+            fi
+            names+=("$info")
+            # find already told us the owner - calling stat per row made a
+            # folder like /usr/bin redraw at a crawl.
+            if user_mode && [[ "$own" != "$me" ]]; then owned+=(0); else owned+=(1); fi
+        done < <(find "$cur" -mindepth 1 -maxdepth 1 \( -type d -o -type f \) ! -name $'*\n*' ! -name $'*\t*' \
+                     -printf '%y\t%s\t%Ty-%Tm-%Td\t%u\t%m\t%f\0' 2>/dev/null | LC_ALL=C sort -z -t $'\t' -k1,1 -k6)
+        n=${#tags[@]}
+        (( n )) || { tags=(".."); names=("$hint_up"); owned=(1); n=1; }
+      fi
+        (( i >= n )) && i=$(( n - 1 )); (( i < 0 )) && i=0
+        # counted here rather than with $(bk_sel_count): that forks a process
+        nsel=0; for sp in "${!BK_SEL[@]}"; do [[ -n "${BK_SEL[$sp]}" ]] && (( nsel++ )); done
+        (( i < top )) && top=$i
+        (( i >= top + rows )) && top=$(( i - rows + 1 ))
+
+        {
+            ui_frame
+            ui_head "$w" "${UI_MUT}${badge}${UI_R}   ${UI_D}|${UI_R}  ${UI_B}${title_sel}${UI_R}"
+            ui_row "$w" "${UI_MUT}$(L '위치' 'Path')${UI_R}  $cur"
+            ui_row "$w" "${UI_D}$(L '[x] 표시한 것이 백업됩니다. 폴더를 표시하면 안의 파일까지 전부.' 'Items marked [x] are backed up. A marked folder includes everything inside.')${UI_R}"
+            ui_row "$w" ""
+            for (( idx=top; idx<top+rows && idx<n; idx++ )); do
+                full="${cur%/}/${tags[idx]%/}"
+                mark="[ ]"; [[ -n "${BK_SEL[$full]:-}" ]] && mark="${UI_OK}[x]${UI_R}"
+                [[ "${tags[idx]}" == ".." ]] && mark="   "
+                lock=""; (( owned[idx] )) || lock="${UI_D} $(L '(내 것 아님)' '(not yours)')${UI_R}"
+                if (( idx == i )); then
+                    ui_row "$w" "${UI_ACC}▌${UI_R} ${mark} ${UI_B}${tags[idx]}${UI_R}${lock}"
+                    ui_row "$w" "${UI_ACC}▌${UI_R}     ${UI_MUT}${names[idx]}${UI_R}"
+                else
+                    ui_row "$w" "${UI_D}│${UI_R} ${mark} ${tags[idx]}${lock}"
+                fi
+            done
+            ui_sep "$w"
+            [[ -n "$note" ]] && { ui_row "$w" "${UI_WARN}${note}${UI_R}"; ui_sep "$w"; }
+            ui_row "$w" "${UI_D}${hint_keys}${UI_R}   ${UI_ACC}${nsel}${UI_R}${UI_D} ${hint_sel}${UI_R}"
+            ui_bot "$w"
+        }
+        ui_flush
+        note=""
+        k="$(ui_key)" || k=esc
+        full="${cur%/}/${tags[i]%/}"
+        case "$k" in
+            up)    (( i > 0 )) && (( i-- )) ;;
+            down)  (( i < n - 1 )) && (( i++ )) ;;
+            "ch: ")
+                   if [[ "${tags[i]}" == ".." ]]; then :
+                   elif (( owned[i] )); then
+                       if [[ -n "${BK_SEL[$full]:-}" ]]; then BK_SEL["$full"]=""; else BK_SEL["$full"]=1; fi
+                   else
+                       note="$(L '내 것이 아니라 고를 수 없습니다 (b 를 누르면 이유를 봅니다)' 'Not yours, so it cannot be picked (press b for why)')"
+                       denied=1
+                   fi ;;
+            enter) case "${tags[i]}" in
+                       "..") cur="$(dirname "$cur")"; i=0; top=0 ;;
+                       */)   cur="${cur%/}/${tags[i]%/}"; i=0; top=0 ;;
+                   esac ;;
+            ch:g)  ui_leave
+                   path="$(dlg_input "$(L '경로 입력' 'Go to path')" "$(L '이동할 폴더 경로를 입력하세요.' 'Enter a folder path to go to.')" "$cur")"
+                   if [[ -n "${path:-}" && -d "$path" ]]; then cur="$(cd "$path" && pwd -P)"; i=0; top=0; fi
+                   ui_enter ;;
+            ch:b)  if (( denied )); then
+                       denied=0; ui_leave; msg "$(L '선택할 수 없는 항목' 'Cannot be selected')" "$(bk_not_mine_text)" 11; ui_enter; continue
+                   fi
+                   if (( $(bk_sel_count) == 0 )); then
+                       note="$(L '아직 고른 것이 없습니다. Space 로 표시하세요.' 'Nothing picked yet - press Space to mark something.')"
+                       continue
+                   fi
+                   ui_leave; return 0 ;;
+            esc|quit) ui_leave; return 1 ;;
+        esac
+    done
+}
+
 bk_browse() {
-    local cur="$1" focus="" rows cols H W LH out rc
+    local cur="$1" focus="" rows cols H W LH out rc denied=0
+    if modern; then bk_browse_modern "$cur"; return $?; fi
     local typ size mt own mode name tag info full cur_tag line inside p other
     local -a args tags lines
     while true; do
@@ -1573,9 +2181,14 @@ bk_browse() {
         for tag in "${tags[@]}"; do BK_SEL["${cur%/}/${tag%/}"]=""; done
         for line in "${lines[@]}"; do
             [[ -z "$line" || "$line" == ".." ]] && continue
-            BK_SEL["${cur%/}/${line%/}"]=1
+            full="${cur%/}/${line%/}"
+            if bk_may_select "$full"; then BK_SEL["$full"]=1; else denied=1; fi
         done
 
+        if (( denied )); then
+            denied=0
+            msg "$(L '선택할 수 없는 항목' 'Cannot be selected')" "$(bk_not_mine_text)" 11
+        fi
         case "$rc" in
             0)  if (( $(bk_sel_count) == 0 )); then
                     msg "$(L '선택된 항목 없음' 'Nothing selected')" \
@@ -1608,6 +2221,12 @@ bk_err_text() { awk 'NR<=2 { printf "%s%s", (NR > 1 ? "\\n        " : ""), $0 }'
 
 bk_copy_one() {
     local src="$1" base destdir dest part policy n a b lnk ldir
+    # Defence in depth: whatever the browser allowed, never copy something this
+    # account does not own (see bk_may_select).
+    if ! bk_may_select "$src"; then
+        BK_MSG="$(L '실패' 'FAILED')  $src\n        $(L '내 소유가 아니라 백업하지 않았습니다' 'not owned by you, so it was not backed up')"
+        return 1
+    fi
     base="$(basename "$src")"
     if [[ "$BK_DEST_MODE" == dir ]]; then destdir="$BK_DEST_DIR"; else destdir="$(dirname "$src")"; fi
     if [[ -d "$src" && ( "$destdir" == "$src" || "$destdir" == "$src"/* ) ]]; then
@@ -1680,6 +2299,14 @@ bk_copy_one() {
 bk_tar_all() {
     local destdir dest part policy n p common cnt
     local -a rcs
+    # Defence in depth: whatever the browser allowed, never bundle something
+    # this account does not own (see bk_may_select).
+    for p in "$@"; do
+        if ! bk_may_select "$p"; then
+            BK_MSG="$(L '실패' 'FAILED')  $p\n        $(L '내 소유가 아니라 백업하지 않았습니다' 'not owned by you, so it was not backed up')"
+            return 1
+        fi
+    done
     if [[ "$BK_DEST_MODE" == dir ]]; then destdir="$BK_DEST_DIR"
     else   # common parent folder of the sources
         common="$(dirname "$1")"
@@ -2132,7 +2759,12 @@ bk_cron_write_script() {
 # Only on the last day of the month (tomorrow is the 1st)
 [ "$(date -d tomorrow +%d)" = "01" ] || exit 0'
     mkdir -p -- "$(dirname -- "$BK_CRON_SH")" 2>/dev/null
-    cat >"$BK_CRON_SH" <<EOS
+    # Errors go to the result file, not to the screen: this also runs from the
+    # package scriptlet and from cron, where a stray message helps nobody.
+    # Order matters: stderr has to be redirected before the output file is
+    # opened, or the shell prints "Permission denied" straight to the screen
+    # and tears the TUI.
+    cat 2>"$TMP_OUT" >"$BK_CRON_SH" <<EOS
 #!/bin/bash
 # Generated by safetui ${APP_VERSION}. Edited by hand? The next schedule change overwrites it.
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -2141,7 +2773,8 @@ exec >>"${BK_CRON_SH%.sh}.log" 2>&1
 echo "--- \$(date '+%Y-%m-%d %H:%M:%S') ---"
 ${self} --db-backup
 EOS
-    chmod 700 "$BK_CRON_SH"
+    chmod 700 "$BK_CRON_SH" 2>>"$TMP_OUT" || return 1
+    return 0
 }
 
 # Replace our block in the crontab (keeping every other line untouched)
@@ -2149,6 +2782,12 @@ bk_cron_apply() {
     local self="$1" spec cur
     spec="$(bk_cron_spec)" || return 1
     bk_cron_write_script "$self" || return 1
+    # The crontab line points at that script, so never register one without it.
+    # A cron entry calling a file that is not there fails every night, silently.
+    if [[ ! -x "$BK_CRON_SH" ]]; then
+        echo "$(L '예약 실행 스크립트를 만들지 못했습니다' 'Could not create the script the schedule runs'): $BK_CRON_SH" >"$TMP_OUT"
+        return 1
+    fi
     cur="$(crontab -l 2>/dev/null | sed "\|^${BK_CRON_BEGIN}\$|,\|^${BK_CRON_END}\$|d")"
     { [[ -n "$cur" ]] && printf '%s\n' "$cur"
       printf '%s\n' "$BK_CRON_BEGIN"
@@ -2224,7 +2863,9 @@ bk_sched_apply() {
             echo "$(L '이 계정은 crontab 을 쓸 수 없습니다 (/etc/cron.allow · cron.deny 확인 필요).'                      'This account may not use crontab (check /etc/cron.allow and cron.deny).')" >"$TMP_OUT"
             return 1
         fi
-        bk_cron_apply "$self" || return 1
+        # Half-applied is worse than not applied: if anything failed, take the
+        # crontab line back out so nothing is left pointing at a missing script.
+        if ! bk_cron_apply "$self"; then bk_cron_remove; return 1; fi
         return 0
     fi
 
@@ -2299,8 +2940,18 @@ bk_sched_log_text() {
 }
 
 bk_sched() {
-    local choice v
+    local choice v healed=0
     bk_load
+    # Self-heal: a crontab line whose script is gone would fail every night and
+    # say nothing. Put the script back from the settings we have.
+    if [[ "$BK_SCHED_METHOD" == cron ]] && bk_cron_active && [[ ! -x "$BK_CRON_SH" ]]; then
+        bk_sched_apply && healed=1
+    fi
+    if (( healed )); then
+        msg "$(L '예약 복구' 'Schedule repaired')" "$(L '예약은 걸려 있는데 실행 스크립트가 없어서 다시 만들었습니다.'      'The schedule was registered but the script it runs was missing, so it was created again.')
+
+$BK_CRON_SH" 10
+    fi
     while true; do
         choice="$(dlg --title "$(L 'DB 자동 백업 예약' 'Scheduled DB backup')" --cancel-label "$(L '뒤로' 'Back')" \
             --menu "$(L '정해 둔 시각에 DB 백업을 자동으로 실행합니다. (safetui 를 켜 둘 필요 없음)' 'Runs the DB backup automatically at the set time. (safetui need not stay open)')\n\n$(L '현재 예약   :' 'Schedule :') $(bk_sched_label)\n$(L '다음 실행   :' 'Next run :') $(bk_sched_next)\n$(L '마지막 실행 :' 'Last run :') $(bk_sched_last)\n$(L '실행 방식   :' 'Run by   :') $(bk_sched_method_label)" \
@@ -2361,7 +3012,12 @@ bk_sched() {
         fi
         BK_SCHED_TIME="$v"
         case "$choice" in 1) BK_SCHED="daily" ;; 2) BK_SCHED="weekly" ;; 3) BK_SCHED="monthly" ;; esac
-        bk_save
+        # If the settings cannot be written there is no point registering a
+        # schedule: the next run would read the old values back. Say so and stop.
+        if ! bk_save; then
+            msg "$(L '예약 — 실패' 'Schedule - Failed')" "$(L '설정을 저장하지 못해 예약하지 않았습니다.' 'The settings could not be saved, so nothing was scheduled.')\n\n$BK_CONF" 10
+            continue
+        fi
         if bk_sched_apply && { [[ "$BK_SCHED_METHOD" == cron ]] && bk_cron_active                                || { [[ "$BK_SCHED_METHOD" != cron ]] && sctl is-active --quiet "$BK_UNIT.timer"; }; }; then
             BK_DUMP="$(bk_dump_bin)" || v="\n\n$(L '[주의] 지금 설정된 경로에서 MariaDB 를 찾지 못했습니다. 백업 설정을 확인하세요.' '[CAUTION] MariaDB was not found under the configured path. Check Backup settings.')"
             [[ -n "${BK_DUMP:-}" ]] && v=""
@@ -2759,11 +3415,18 @@ lang_menu() {
 status_menu() {
     local c
     while true; do
-        c="$(dlg --title "$(L '상태 보기' 'Status')" --cancel-label "$(L '뒤로' 'Back')"             --menu "$(L '읽기만 합니다. 아무것도 바꾸지 않습니다.' 'Read-only. Nothing is changed.')" 15 "$DLG_W" 4             1 "$(L 'SELinux 상태' 'SELinux status')"             2 "$(L 'SELinux 설정값(boolean) 목록' 'SELinux booleans')"             3 "$(L '실행 중인 서비스' 'Running services')"             4 "$(L '디스크 여유 공간' 'Disk space')")" || return 0
+        c="$(dlg --title "$(L '상태 보기' 'Status')" --cancel-label "$(L '뒤로' 'Back')" \
+            --menu "$(L '읽기만 합니다. 아무것도 바꾸지 않습니다.' 'Read-only. Nothing is changed.')" 15 "$DLG_W" 4 \
+            1 "$(L 'SELinux 상태' 'SELinux status')	$(L '켜짐/꺼짐과 자세한 상태' 'Enforcing or not, and the details')" \
+            2 "$(L 'SELinux 설정값' 'SELinux booleans')	$(L '켜고 끌 수 있는 항목 목록' 'The switches and their values')" \
+            3 "$(L '실행 중인 서비스' 'Running services')	$(L '지금 돌고 있는 서비스' 'What is running right now')" \
+            4 "$(L '디스크 여유 공간' 'Disk space')	$(L '백업을 받기 전에 확인' 'Check before taking a backup')")" || return 0
         case "$c" in
-            1) show_text "$(L 'SELinux 상태' 'SELinux status')" bash -c                  'echo "getenforce: $(getenforce 2>&1)"; echo; sestatus 2>&1 || true' ;;
+            1) show_text "$(L 'SELinux 상태' 'SELinux status')" bash -c \
+                 'echo "getenforce: $(getenforce 2>&1)"; echo; sestatus 2>&1 || true' ;;
             2) show_text "$(L 'SELinux 설정값(boolean)' 'SELinux booleans')" bash -c 'getsebool -a 2>&1' ;;
-            3) show_text "$(L '실행 중인 서비스' 'Running services')" bash -c                  'systemctl list-units --type=service --state=running --no-pager --no-legend 2>&1' ;;
+            3) show_text "$(L '실행 중인 서비스' 'Running services')" bash -c \
+                 'systemctl list-units --type=service --state=running --no-pager --no-legend 2>&1' ;;
             4) show_text "$(L '디스크 여유 공간' 'Disk space')" bash -c 'df -hT -x tmpfs -x devtmpfs 2>&1' ;;
         esac
     done
@@ -2773,12 +3436,53 @@ status_menu() {
 user_main_menu() {
     local c
     while true; do
-        c="$(dlg --title "$(L '메인 메뉴' 'Main menu')" --cancel-label "$(L '종료' 'Quit')"             --menu "$(L '일반 사용자 모드입니다. 관리 기능은 sudo safetui 로 실행하세요.'                        'Normal-user mode. For the admin features run: sudo safetui')" 15 "$DLG_W" 4             1 "$(L '백업' 'Backup')"             2 "$(L '상태 보기' 'Status')"             3 "$(L '언어 변경 / Language' 'Language')"             4 "$(L '정보 / 도움말' 'About / Help')")" || return 0
+        c="$(dlg --title "$(L '메인 메뉴' 'Main menu')" --cancel-label "$(L '종료' 'Quit')" \
+            --menu "$(L '일반 사용자 모드입니다. 관리 기능은 sudo safetui 로 실행하세요.' \
+                       'Normal-user mode. For the admin features run: sudo safetui')" 17 "$DLG_W" 5 \
+            1 "$(L '백업' 'Backup')	$(L '파일·폴더와 DB 백업, 자동 예약' 'Files, folders, DB dumps and the schedule')" \
+            2 "$(L '상태 보기' 'Status')	$(L 'SELinux·서비스·디스크 (읽기만)' 'SELinux, services, disk - read-only')" \
+            3 "$(L '언어 변경 / Language' 'Language')	$(L '한국어 / English' 'Korean / English')" \
+            4 "$(L '정보 / 도움말' 'About / Help')	$(L '버전과 설정 파일 위치' 'Version and where the settings live')" \
+            5 "$(L '화면 설정' 'Screen')	$(L '화면 방식과 강조 색' 'The style and the accent colour')")" || return 0
         case "$c" in
             1) backup_menu ;;
             2) status_menu ;;
             3) lang_menu ;;
             4) info_menu ;;
+            5) ui_settings_menu ;;
+        esac
+    done
+}
+
+
+# Screen settings - which style, and the accent colour of the modern one.
+ui_style_label() {
+    if modern; then L '새 화면' 'New'; else L '기본 (dialog)' 'Classic (dialog)'; fi
+}
+ui_settings_menu() {
+    local c v
+    while true; do
+        c="$(dlg --title "$(L '화면 설정' 'Screen')" --cancel-label "$(L '뒤로' 'Back')" \
+            --menu "$(L '화면 모양을 고릅니다.' 'Choose how the screens look.')" 13 "$DLG_W" 2 \
+            1 "$(L '화면 방식' 'Style')	$(ui_style_label)" \
+            2 "$(L '강조 색' 'Accent colour')	$(ui_accent_label)")" || return 0
+        case "$c" in
+            1) v="$(dlg --title "$(L '화면 방식' 'Style')" --default-item "$UI_STYLE" \
+                    --menu "$(L '어떤 화면으로 쓸까요?' 'Which style?')" 13 "$DLG_W" 2 \
+                    classic "$(L '기본 (dialog)' 'Classic (dialog)')	$(L '지금까지 쓰던 파란 창' 'The blue windows used so far')" \
+                    modern  "$(L '새 화면' 'New')	$(L '설명이 같이 보이는 어두운 화면' 'Dark screens with a description line')")" || continue
+               UI_STYLE="$v"; ui_save; ui_init_colors
+               # leaving or entering the alternate screen as the style changes
+               if modern; then ui_begin; else printf '[?25h[?1049l' >&3 2>/dev/null; fi ;;
+            2) v="$(dlg --title "$(L '강조 색' 'Accent colour')" --default-item "$UI_ACCENT" \
+                    --menu "$(L '고른 항목과 제목에 쓰이는 색입니다.' 'Used for the selected item and for titles.')" 15 "$DLG_W" 6 \
+                    orange "$(ui_accent_label orange)" sky    "$(ui_accent_label sky)" \
+                    green  "$(ui_accent_label green)"  purple "$(ui_accent_label purple)" \
+                    pink   "$(ui_accent_label pink)"   yellow "$(ui_accent_label yellow)")" || continue
+               UI_ACCENT="$v"; ui_save; ui_init_colors
+               modern || msg "$(L '강조 색' 'Accent colour')" \
+                   "$(L '색을 저장했습니다. 화면 방식을 "새 화면" 으로 바꾸면 보입니다.' \
+                        'Saved. You will see it once the style is set to "New".')" 8 ;;
         esac
     done
 }
@@ -2789,13 +3493,14 @@ main_menu() {
         local choice
         GOT_INT=0
         choice="$(dlg --title "$(L '메인 메뉴' 'Main menu')" --cancel-label "$(L '종료' 'Quit')" --default-button "$defbtn" \
-            --menu "$(L '무엇을 관리할까요?' 'What would you like to manage?')" 17 "$DLG_W" 6 \
-            1 "$(L '방화벽 관리' 'Firewall')" \
-            2 "$(L 'SELinux 관리' 'SELinux')" \
-            3 "$(L '작업 안전장치' 'Lockout guard')" \
-            4 "$(L '백업' 'Backup')" \
-            5 "$(L '언어 변경 / Language' 'Language')" \
-            6 "$(L '정보 / 도움말' 'About / Help')")"
+            --menu "$(L '무엇을 관리할까요?' 'What would you like to manage?')" 20 "$DLG_W" 7 \
+            1 "$(L '방화벽 관리' 'Firewall')	$(L '포트·서비스 열고 닫기, 허용 IP' 'Open or close ports and services, allowed IPs')" \
+            2 "$(L 'SELinux 관리' 'SELinux')	$(L '모드, 포트 정책, 파일 컨텍스트' 'Mode, port policy, file contexts')" \
+            3 "$(L '작업 안전장치' 'Lockout guard')	$(L '되돌릴 수 있게 잠가 두고 작업' 'Work with an automatic rollback armed')" \
+            4 "$(L '백업' 'Backup')	$(L '파일·폴더와 DB 백업, 자동 예약' 'Files, folders, DB dumps and the schedule')" \
+            5 "$(L '언어 변경 / Language' 'Language')	$(L '한국어 / English' 'Korean / English')" \
+            6 "$(L '정보 / 도움말' 'About / Help')	$(L '버전과 설정 파일 위치' 'Version and where the settings live')" \
+            7 "$(L '화면 설정' 'Screen')	$(L '화면 방식과 강조 색' 'The style and the accent colour')")"
         rc=$?
         # Only the <Quit> button (1) ends the program. ESC / Ctrl+C do not quit; they just move the cursor to <Quit>
         # (so that after pressing ESC back to the main menu, Enter leads to quitting).
@@ -2825,6 +3530,7 @@ main_menu() {
             4) backup_menu ;;
             5) lang_menu ;;
             6) info_menu ;;
+            7) ui_settings_menu ;;
         esac
     done
 }
@@ -2834,7 +3540,7 @@ case "${1:-}" in
     -v|--version) echo "${APP_NAME} ${APP_VERSION}"; exit 0 ;;
     --db-backup)  bk_db_cli; exit $? ;;
     --apply-schedule)   # re-register the saved schedule in systemd (called by the package scriptlet after a package swap)
-        bk_load; bk_sched_apply; exit 0 ;;
+        bk_load; bk_sched_apply; exit $? ;;
     -e|--en|--english) LANG_MODE="en"; save_lang; shift ;;
     -k|--ko|--korean)  LANG_MODE="ko"; save_lang; shift ;;
     -h|--help)
@@ -2862,6 +3568,9 @@ if user_mode; then
 else
     BACKTITLE="safetui ${APP_VERSION} — $(L '방화벽·SELinux·작업 안전장치·백업' 'Firewall·SELinux·Guard·Backup')"
 fi
+ui_load
+ui_init_colors
+ui_begin
 preflight
 start_ticker
 if user_mode; then user_main_menu; else main_menu; fi

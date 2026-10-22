@@ -1,5 +1,5 @@
 Name:           safetui
-Version:        3.3.0
+Version:        3.4.0
 Release:        1%{?dist}
 Summary:        Menu-driven firewall, SELinux, lockout guard and backup tool
 
@@ -79,6 +79,33 @@ fi
 %dir %attr(0700,root,root) %{_sharedstatedir}/safetui-guard
 
 %changelog
+* Thu Oct 22 2026 JJ <mrwhitehacker@naver.com> - 3.4.0-1
+- A second screen style, chosen from the new "Screen" item in the main menu:
+  the familiar dialog windows, or screens drawn by safetui itself that show a
+  one-line description under every menu item. The accent colour is settable
+  (orange, sky, green, purple, pink, yellow). Classic stays the default
+- Menus, messages, confirmations, long output, the input box, the wait boxes
+  and the checklists all follow the chosen style. Picking files to back up is
+  still drawn by dialog
+- The file browser is drawn in the chosen style too, so no screen falls back to
+  dialog any more
+- A normal user can only back up what they own. Being able to read a file was
+  not enough of a reason: cp happily copies a world-readable system file, and
+  the copy then belongs to whoever ran the backup. Such entries are listed and
+  marked "not yours" but cannot be picked, folders stay walkable so people can
+  still reach their own files, and the copy itself refuses them as well
+- The schedule can no longer end up half applied. The settings are saved first
+  and nothing is registered if that fails; the crontab line is only written once
+  the script it calls exists, and is taken back out if any step fails. A
+  schedule whose script went missing is rebuilt when the schedule screen opens
+- The new screens redraw without clearing first and leave as one write, and no
+  longer fork a process per row, so they stop flashing and keep up with the
+  keyboard (a 22-row frame went from 73 ms to 3 ms). The file browser reads the
+  folder only when the folder changes
+- Fixed: writing the draw redirection as `exec 3>/dev/tty 2>/dev/null` also sent
+  the script's own stderr to /dev/null for good, and dialog draws on stderr, so
+  the classic screens would have shown nothing at all
+
 * Thu Oct 22 2026 JJ <mrwhitehacker@naver.com> - 3.3.0-1
 - Normal users can now run safetui without root. The menu then shows only what
   works without privileges: file / DB backup, the schedule and read-only status.
