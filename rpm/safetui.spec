@@ -1,5 +1,5 @@
 Name:           safetui
-Version:        3.4.0
+Version:        3.5.0
 Release:        1%{?dist}
 Summary:        Menu-driven firewall, SELinux, lockout guard and backup tool
 
@@ -79,6 +79,23 @@ fi
 %dir %attr(0700,root,root) %{_sharedstatedir}/safetui-guard
 
 %changelog
+* Fri Oct 23 2026 JJ <mrwhitehacker@naver.com> - 3.5.0-1
+- Security hardening after an external review (findings S15-S24):
+  - safetui-guard: __rollback / __warn now require root; do_rollback only
+    restores from inside the snapshot root, so no caller can point it at an
+    arbitrary directory; rollback only runs while a guard is armed; the timer
+    binary is resolved like the backup schedule (installed copy, else a
+    root-only path) instead of a hardcoded path
+  - A database name can no longer start with a hyphen, and a user-supplied name
+    is passed to mariadb-dump after "--" so it cannot act as an option
+  - SELinux inputs are validated (port number, module name, absolute path) so
+    they cannot be read as options by semanage / audit2allow / restorecon
+  - The password file is removed on a wait timeout, the cron log is created
+    owner-only, the settings folder is created 0700, and the crontab entry
+    quotes its script path
+  - preflight checks for whiptail; a normal user may back up folders they own;
+    bk_tar_all detects a failing find via pipefail
+
 * Thu Oct 22 2026 JJ <mrwhitehacker@naver.com> - 3.4.0-1
 - A second screen style, chosen from the new "Screen" item in the main menu:
   the familiar dialog windows, or screens drawn by safetui itself that show a

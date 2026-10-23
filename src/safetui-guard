@@ -33,6 +33,25 @@ case "$_gl" in ko|KO|korean) GLANG="ko" ;; *) GLANG="en" ;; esac
 L() { if [[ "$GLANG" == "en" ]]; then printf '%s' "$2"; else printf '%s' "$1"; fi; }
 
 need_root() { [[ $EUID -eq 0 ]] || { echo "$(L 'root 권한 필요' 'root required'): sudo safetui-guard $*"; exit 1; }; }
+
+# The binary the systemd timer will run as root. Prefer the installed copy; fall
+# back to the running file only when it is root-owned with no group/other write
+# the whole way up, so a copy left in /tmp can never be pinned into a root timer.
+guard_self() {
+    local p="/usr/bin/safetui-guard" owner mode d
+    [[ -x "$p" ]] || p="$(readlink -f -- "$0" 2>/dev/null)"
+    [[ -n "$p" && -x "$p" && ! -L "$p" ]] || return 1
+    d="$p"
+    while :; do
+        owner="$(stat -c %u -- "$d" 2>/dev/null)" || return 1
+        mode="$(stat -c %a -- "$d" 2>/dev/null)"
+        [[ "$owner" == 0 ]] || return 1
+        (( 8#${mode:-0} & 8#0022 )) && return 1
+        [[ "$d" == "/" ]] && break
+        d="$(dirname -- "$d")"
+    done
+    printf '%s' "$p"
+}
 # Log through logger only when interactive (terminal). Under systemd, stdout already goes
 # to the journal (SYSLOG_IDENTIFIER=safetui-guard), so this avoids duplicate entries.
 log() { echo "$*"; if [[ -t 1 ]]; then logger -t safetui-guard "$*" 2>/dev/null; fi; return 0; }
@@ -154,7 +173,16 @@ snapshot() {
 
 # do_rollback <snapshot dir> <auto|manual>
 do_rollback() {
-    local dir="${1:-$ACTIVE}" mode="${2:-manual}" targets armed done_at
+    local dir="${1:-$ACTIVE}" mode="${2:-manual}" targets armed done_at real
+    # Only ever restore from inside the snapshot root. do_rollback writes the files
+    # it finds over /etc/ssh, /etc/firewalld and so on, so a caller that could pass
+    # an arbitrary directory ("sudo safetui-guard __rollback /tmp/evil") would own
+    # the system. Resolve the path and refuse anything outside SNAP_ROOT.
+    real="$(readlink -f -- "$dir" 2>/dev/null)"
+    case "$real/" in
+        "$SNAP_ROOT"/*) dir="$real" ;;
+        *) log "$(L '롤백 경로가 허용 범위를 벗어났습니다' 'rollback path is outside the snapshot root'): $dir"; return 1 ;;
+    esac
     [[ -d "$dir" ]] || { log "$(L '롤백 스냅샷 없음' 'no rollback snapshot'): $dir"; return 1; }
     targets="$(cat "$dir/targets" 2>/dev/null)"
     armed="$(date -d "@$(cat "$dir/armed_at" 2>/dev/null)" '+%H:%M:%S' 2>/dev/null)"
@@ -334,9 +362,10 @@ cmd_arm() {
 
     # transient systemd-run timer (PID 1 runs it even if the session dies). The language is passed along.
     local runerr
+    local self; self="$(guard_self)" || { echo "$(L '타이머에 쓸 safetui-guard 실행 파일을 찾지 못했습니다 (설치본이 아니거나 root 전용 경로가 아님).' 'No trusted safetui-guard binary for the timer (not the installed copy, or not a root-only path).')"; return 1; }
     runerr="$(systemd-run --unit="$UNIT" --on-active="${timeout}" --timer-property=AccuracySec=1s \
         --setenv=SAFETUI_LANG="$GLANG" \
-        --collect /usr/bin/safetui-guard __rollback "$ACTIVE" 2>&1)"
+        --collect "$self" __rollback "$ACTIVE" 2>&1)"
     local rc=$?
     if [[ $rc -ne 0 ]] || ! timer_active; then
         rm -rf "$ACTIVE"
@@ -360,7 +389,7 @@ EOF
     local warn_in=$(( timeout - WARN_BEFORE ))
     (( warn_in < 1 )) && warn_in=1
     systemd-run --unit="$WARN_UNIT" --on-active="${warn_in}" --timer-property=AccuracySec=1s \
-        --setenv=SAFETUI_LANG="$GLANG" --collect /usr/bin/safetui-guard __warn >/dev/null 2>&1
+        --setenv=SAFETUI_LANG="$GLANG" --collect "$self" __warn >/dev/null 2>&1
 
     log "$(L "가드 ARM: ${timeout}초 후 자동 롤백 예약" "guard ARM: auto-rollback in ${timeout}s") ($(L '대상' 'targets'): $targets, note: ${note:-none})"
     hist "$(L "안전장치 켬 [${targets}] $(who_ran), ${timeout}초 뒤 자동 원복 예약${note:+, 메모: $note}" \
@@ -429,6 +458,15 @@ cmd_status() {
 
 cmd_rollback() {
     need_root rollback
+    # Roll back only while the timer is still counting down. After "ok" the
+    # armed_at file is still there (only "confirmed" is added), and when nothing is
+    # armed the snapshot is stale - an accidental rollback would then revert the
+    # firewall / SSH / network to that old state. The timer being active is the one
+    # signal that a live guard is waiting to be confirmed or rolled back.
+    if ! timer_active; then
+        echo "$(L '되돌릴 활성 가드가 없습니다. (상태 확인: safetui-guard status)' 'No active guard to roll back. (check: safetui-guard status)')"
+        return 1
+    fi
     disarm_timer
     do_rollback "$ACTIVE" manual
 }
@@ -489,7 +527,7 @@ case "${1:-}" in
     status)     cmd_status;;
     rollback)   cmd_rollback;;
     log)        shift; cmd_log "$@";;
-    __rollback) shift; do_rollback "${1:-$ACTIVE}" auto;;   # called by the systemd timer (internal)
-    __warn)     do_warn;;                               # reminder before the rollback (internal)
+    __rollback) need_root __rollback; shift; do_rollback "${1:-$ACTIVE}" auto;;   # called by the systemd timer (internal)
+    __warn)     need_root __warn; do_warn;;                               # reminder before the rollback (internal)
     *)          usage;;
 esac
