@@ -154,6 +154,12 @@ marked "not yours" and cannot be selected.
 Stored in `/etc/safetui/backup.conf`, or `~/.config/safetui/backup.conf` for a
 normal user (mode 600, owner only). Change them from **Backup > Backup settings**.
 
+The DB password is stored AES-256 encrypted (`DB_PASS_ENC`). The key is a random
+256-bit value in its own owner-only file, `backup.key`, in the same folder, so the
+settings file alone does not reveal the password. Anyone who can read both files
+(root, or the owner) can still decrypt it. A plain-text password written by a
+version before 3.5.1 is encrypted the next time the settings are read.
+
 The password is never read from the packaged defaults file
 (`/usr/share/safetui/defaults.conf`): that file is world-readable, so a password
 left there would be visible to every account on the server.

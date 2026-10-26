@@ -11,7 +11,7 @@
 set -o pipefail
 
 APP_NAME="safetui"
-APP_VERSION="3.5.0"
+APP_VERSION="3.5.1"
 
 # Screen widths are counted in characters. Under LC_ALL=C bash counts bytes instead,
 # which makes every Korean line ragged, so make sure we are in a UTF-8 locale.
@@ -843,7 +843,56 @@ valid_port() {
     local a=$(( 10#${BASH_REMATCH[1]} )) b=$(( 10#${BASH_REMATCH[3]:-${BASH_REMATCH[1]}} ))
     (( a >= 1 && b <= 65535 && a <= b ))
 }
-valid_ipcidr() { [[ "$1" =~ ^[0-9A-Fa-f:.]+(/[0-9]{1,3})?$ ]]; }
+valid_ipv4() {
+    [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    local i
+    for i in 1 2 3 4; do (( 10#${BASH_REMATCH[i]} <= 255 )) || return 1; done
+}
+# colon-separated hex groups of 1-4 digits; prints how many
+v6_groups() {
+    local g n=0
+    [[ -z "$1" ]] && { echo 0; return 0; }
+    [[ "$1" == :* || "$1" == *: || "$1" == *::* ]] && return 1
+    local IFS=:
+    for g in $1; do
+        [[ "$g" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+        (( n++ ))
+    done
+    echo "$n"
+}
+valid_ipv6() {
+    local a="$1" left right nl nr total=8
+    [[ "$a" == *:* ]] || return 1
+    # an IPv4 tail (::ffff:192.0.2.1) takes the place of two groups
+    if [[ "$a" == *.* ]]; then
+        valid_ipv4 "${a##*:}" || return 1
+        a="${a%"${a##*:}"}"; total=6
+        [[ "$a" != *:: ]] && a="${a%:}"
+    fi
+    if [[ "$a" == *::* ]]; then
+        left="${a%%::*}"; right="${a#*::}"
+        nl="$(v6_groups "$left")" && nr="$(v6_groups "$right")" || return 1
+        (( nl + nr < total ))
+    else
+        nl="$(v6_groups "$a")" || return 1
+        (( nl == total ))
+    fi
+}
+# IPv4 or IPv6 address, optionally with a prefix length in range (/0-32, /0-128)
+valid_ipcidr() {
+    local addr="$1" pfx=""
+    if [[ "$addr" == */* ]]; then
+        pfx="${addr#*/}"; addr="${addr%%/*}"
+        [[ "$pfx" =~ ^[0-9]{1,3}$ ]] || return 1
+    fi
+    if valid_ipv4 "$addr"; then
+        [[ -z "$pfx" ]] || (( 10#$pfx <= 32 ))
+    elif valid_ipv6 "$addr"; then
+        [[ -z "$pfx" ]] || (( 10#$pfx <= 128 ))
+    else
+        return 1
+    fi
+}
 
 # split_list "<a, b,c d>" -> LIST=(a b c d): commas and/or spaces, empty items and duplicates dropped
 split_list() {
@@ -868,11 +917,25 @@ list_lines() {
     (( $# > 12 )) && out+="    … $(L "외 $(( $# - 12 ))개" "and $(( $# - 12 )) more")\n"
     printf '%s' "$out"
 }
-# run firewall-cmd for each item; collect output. FW_OK / FW_FAIL count the results
+# apply the permanent rules to the running firewall; a failure is put at the top of TMP_OUT
+fw_apply_reload() {
+    local out="$TMP_DIR/reload.out"
+    firewall-cmd --reload >"$out" 2>&1 && { cat "$out" >>"$TMP_OUT"; return 0; }
+    {
+        echo "$(L '[실패] 방화벽 다시 적용(reload)에 실패했습니다.' '[FAILED] Firewall reload failed.')"
+        echo "$(L '변경은 영구 규칙에 저장됐지만, 지금 동작 중인 방화벽에는 반영되지 않았습니다.' 'The change is saved in the permanent rules but is not active in the running firewall.')"
+        cat "$out"; echo
+        cat "$TMP_OUT"
+    } >"$out.all"
+    mv -f "$out.all" "$TMP_OUT"
+    return 1
+}
+# run firewall-cmd for each item; collect output. FW_OK / FW_FAIL count the results,
+# FW_RELOAD_FAIL=1 when the rules were saved but could not be applied
 fw_each() {      # fw_each <zone> <--add-port|--remove-port|--add-source|...> items...
     local zone="$1" op="$2"; shift 2
     local x
-    FW_OK=0; FW_FAIL=0; : >"$TMP_OUT"
+    FW_OK=0; FW_FAIL=0; FW_RELOAD_FAIL=0; : >"$TMP_OUT"
     for x in "$@"; do
         if firewall-cmd --zone="$zone" "$op=$x" --permanent >>"$TMP_OUT" 2>&1; then
             (( FW_OK++ ))
@@ -880,9 +943,10 @@ fw_each() {      # fw_each <zone> <--add-port|--remove-port|--add-source|...> it
             (( FW_FAIL++ )); echo "  ↑ $x" >>"$TMP_OUT"
         fi
     done
-    (( FW_OK > 0 )) && firewall-cmd --reload >>"$TMP_OUT" 2>&1
+    if (( FW_OK > 0 )) && ! fw_apply_reload; then FW_RELOAD_FAIL=1; fi
     return 0
 }
+fw_all_ok() { (( FW_FAIL == 0 && FW_RELOAD_FAIL == 0 )); }
 
 # --- warning before a change that can cut the remote session ---
 guard_armed() { systemctl is-active --quiet safetui-guard.timer 2>/dev/null; }
@@ -953,7 +1017,7 @@ fw_add_port() {
 
     if yesno "$(L '확인' 'Confirm')" "$(L "다음 포트 ${#items[@]}개를 [영구]로 모두에게 엽니다." "Open these ${#items[@]} port(s) to everyone [permanent].")\n\n  $(L '존' 'zone'): $zone\n$(list_lines "${items[@]}")\n$(L '진행할까요?' 'Proceed?')" "$(( (${#items[@]} > 12 ? 13 : ${#items[@]}) + 10 ))"; then
         fw_each "$zone" --add-port "${items[@]}"
-        if (( FW_FAIL == 0 )); then
+        if fw_all_ok; then
             msg "$(L '포트 추가 — 성공' 'Add port — OK')" "$(L "'$zone' 존에서 포트 ${FW_OK}개를 모두에게 열었습니다.\n재부팅 후에도 유지됩니다." "Opened ${FW_OK} port(s) to everyone in zone '$zone'.\nIt persists across reboots.")\n\n$(list_lines "${items[@]}")\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" "$DLG_H"
         else
             msg "$(L '포트 추가 — 일부 실패' 'Add port — some failed')" "$(L "성공 ${FW_OK}개, 실패 ${FW_FAIL}개" "${FW_OK} added, ${FW_FAIL} failed")\n\n$(cat "$TMP_OUT")" "$DLG_H"
@@ -981,7 +1045,7 @@ fw_del_port() {
     fi
     if yesno "$(L '확인' 'Confirm')" "$(L "다음 포트 ${#sel[@]}개를 닫습니다." "Close these ${#sel[@]} port(s).")\n\n  $(L '존' 'zone'): $zone\n$(list_lines "${sel[@]}")\n$(L '진행할까요?' 'Proceed?')" "$(( (${#sel[@]} > 12 ? 13 : ${#sel[@]}) + 10 ))"; then
         fw_each "$zone" --remove-port "${sel[@]}"
-        if (( FW_FAIL == 0 )); then
+        if fw_all_ok; then
             msg "$(L '포트 삭제 — 성공' 'Remove port — OK')" "$(L "'$zone' 존에서 포트 ${FW_OK}개를 닫았습니다." "Closed ${FW_OK} port(s) in zone '$zone'.")\n\n$(list_lines "${sel[@]}")\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" "$DLG_H"
         else
             msg "$(L '포트 삭제 — 일부 실패' 'Remove port — some failed')" "$(L "성공 ${FW_OK}개, 실패 ${FW_FAIL}개" "${FW_OK} removed, ${FW_FAIL} failed")\n\n$(cat "$TMP_OUT")" "$DLG_H"
@@ -1005,7 +1069,7 @@ fw_add_source() {
 
     if yesno "$(L '확인' 'Confirm')" "$(L "다음 출발지 ${#LIST[@]}개를 존에 [영구]로 등록합니다." "Assign these ${#LIST[@]} source(s) to the zone [permanent].")\n\n  $(L '존' 'zone'): $zone\n$(list_lines "${LIST[@]}")\n$(L '진행할까요?' 'Proceed?')" "$(( (${#LIST[@]} > 12 ? 13 : ${#LIST[@]}) + 10 ))"; then
         fw_each "$zone" --add-source "${LIST[@]}"
-        if (( FW_FAIL == 0 )); then
+        if fw_all_ok; then
             msg "$(L '출발지 IP 등록 — 성공' 'Assign source IP — OK')" "$(L "이제 아래 ${FW_OK}개에서 오는 접속에 '$zone' 존 규칙이 적용됩니다." "Traffic from these ${FW_OK} source(s) now uses the '$zone' zone rules.")\n\n$(list_lines "${LIST[@]}")\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" "$DLG_H"
         else
             msg "$(L '출발지 IP 등록 — 일부 실패' 'Assign source IP — some failed')" "$(L "성공 ${FW_OK}개, 실패 ${FW_FAIL}개" "${FW_OK} added, ${FW_FAIL} failed")\n\n$(cat "$TMP_OUT")" "$DLG_H"
@@ -1030,7 +1094,7 @@ fw_del_source() {
     lockout_check "$(L "출발지 IP ${sel[*]} 삭제 ($zone 존) — 이 IP 로 접속 중이라면 끊길 수 있습니다" "remove source ${sel[*]} ($zone) — you may be cut off if you connect from it")" || return
     if yesno "$(L '확인' 'Confirm')" "$(L "다음 출발지 ${#sel[@]}개를 존에서 삭제합니다." "Remove these ${#sel[@]} source(s) from the zone.")\n\n  $(L '존' 'zone'): $zone\n$(list_lines "${sel[@]}")\n$(L '진행할까요?' 'Proceed?')" "$(( (${#sel[@]} > 12 ? 13 : ${#sel[@]}) + 10 ))"; then
         fw_each "$zone" --remove-source "${sel[@]}"
-        if (( FW_FAIL == 0 )); then
+        if fw_all_ok; then
             msg "$(L '출발지 IP 등록 삭제 — 성공' 'Remove source IP — OK')" "$(L "'$zone' 존에서 ${FW_OK}개를 뺐습니다." "Removed ${FW_OK} source(s) from zone '$zone'.")\n\n$(list_lines "${sel[@]}")\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" "$DLG_H"
         else
             msg "$(L '출발지 IP 등록 삭제 — 일부 실패' 'Remove source IP — some failed')" "$(L "성공 ${FW_OK}개, 실패 ${FW_FAIL}개" "${FW_OK} removed, ${FW_FAIL} failed")\n\n$(cat "$TMP_OUT")" "$DLG_H"
@@ -1081,7 +1145,7 @@ fw_add_ip_port_rule() {
 
     yesno "$(L '확인' 'Confirm')" "$(L "다음 규칙 ${#rules[@]}개를 [영구]로 추가합니다." "Add these ${#rules[@]} rule(s) [permanent].")\n\n  $(L '존' 'zone'): $zone\n$(list_lines "${human[@]}")\n$(L "※ 이 포트가 '포트 추가'로 모두에게 열려 있다면\n   이 규칙과 상관없이 모두 접속 가능합니다." "* If a port is also opened to everyone via 'Add port',\n  everyone can still connect regardless of this rule.")\n\n$(L '진행할까요?' 'Proceed?')" "$(( (${#rules[@]} > 12 ? 13 : ${#rules[@]}) + 13 ))" || return
     fw_each "$zone" --add-rich-rule "${rules[@]}"
-    if (( FW_FAIL == 0 )); then
+    if fw_all_ok; then
         msg "$(L '특정 IP 허용 — 성공' 'Allow from IP — OK')" "$(L "규칙 ${FW_OK}개를 추가했습니다. ('$zone' 존, 재부팅 후에도 유지)" "Added ${FW_OK} rule(s) (zone '$zone', persists across reboots).")\n\n$(list_lines "${human[@]}")\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" "$DLG_H"
     else
         msg "$(L '특정 IP 허용 — 일부 실패' 'Allow from IP — some failed')" "$(L "성공 ${FW_OK}개, 실패 ${FW_FAIL}개" "${FW_OK} added, ${FW_FAIL} failed")\n\n$(cat "$TMP_OUT")" "$DLG_H"
@@ -1111,7 +1175,7 @@ fw_del_ip_port_rule() {
     [[ -n "$warn" ]] && { lockout_check "$warn" || return; }
     yesno "$(L '확인' 'Confirm')" "$(L "다음 규칙 ${#pick[@]}개를 삭제합니다." "Remove these ${#pick[@]} rule(s).")\n\n$(list_lines "${human[@]}")\n$(L '진행할까요?' 'Proceed?')" "$(( (${#pick[@]} > 12 ? 13 : ${#pick[@]}) + 8 ))" || return
     fw_each "$zone" --remove-rich-rule "${pick[@]}"
-    if (( FW_FAIL == 0 )); then
+    if fw_all_ok; then
         msg "$(L '규칙 삭제 — 성공' 'Remove rule — OK')" "$(L "규칙 ${FW_OK}개를 삭제했습니다." "Removed ${FW_OK} rule(s).")\n\n$(list_lines "${human[@]}")\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" "$DLG_H"
     else
         msg "$(L '규칙 삭제 — 일부 실패' 'Remove rule — some failed')" "$(L "성공 ${FW_OK}개, 실패 ${FW_FAIL}개" "${FW_OK} removed, ${FW_FAIL} failed")\n\n$(cat "$TMP_OUT")" "$DLG_H"
@@ -1130,8 +1194,7 @@ fw_service_manage() {
         for s in $svcs; do args+=("$s" " "); done
         svc="$(dlg --title "$(L '서비스 추가' 'Add service')" --menu "$(L '추가할 서비스를 선택하세요.' 'Select a service to add.')" \
             "$DLG_H" "$DLG_W" "$MENU_H" "${args[@]}")" || return
-        if firewall-cmd --zone="$zone" --add-service="$svc" --permanent >"$TMP_OUT" 2>&1; then
-            firewall-cmd --reload >>"$TMP_OUT" 2>&1
+        if firewall-cmd --zone="$zone" --add-service="$svc" --permanent >"$TMP_OUT" 2>&1 && fw_apply_reload; then
             msg "$(L '서비스 추가 — 성공' 'Add service — OK')" "$(L "'$svc' 서비스를 '$zone' 존에서 모두에게 열었습니다." "Opened service '$svc' to everyone in zone '$zone'.")\n\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" 14
         else
             msg "$(L '서비스 추가 — 실패' 'Add service — Failed')" "$(cat "$TMP_OUT")"
@@ -1146,8 +1209,7 @@ fw_service_manage() {
             lockout_check "$(L "ssh 서비스 삭제 ($zone 존) — 새 SSH 접속이 막힙니다" "remove the ssh service ($zone) — new SSH logins will be blocked")" || return
         fi
         yesno "$(L '확인' 'Confirm')" "$(L '다음 서비스를 존에서 삭제합니다.' 'Remove this service from the zone.')\n\n  $svc ($zone)\n\n$(L '진행할까요?' 'Proceed?')" || return
-        if firewall-cmd --zone="$zone" --remove-service="$svc" --permanent >"$TMP_OUT" 2>&1; then
-            firewall-cmd --reload >>"$TMP_OUT" 2>&1
+        if firewall-cmd --zone="$zone" --remove-service="$svc" --permanent >"$TMP_OUT" 2>&1 && fw_apply_reload; then
             msg "$(L '서비스 삭제 — 성공' 'Remove service — OK')" "$(L "'$zone' 존에서 '$svc' 서비스를 닫았습니다." "Closed service '$svc' in zone '$zone'.")\n\n$(L '명령 결과' 'Command output'):\n$(cat "$TMP_OUT")" 14
         else
             msg "$(L '서비스 삭제 — 실패' 'Remove service — Failed')" "$(cat "$TMP_OUT")"
@@ -1750,7 +1812,36 @@ declare -A BK_USED=()   # backup paths already created in this run
 # The package defaults file is world-readable (0644), so a password put there would be
 # visible to every account on the server. It is never read from there - the password
 # belongs in each account's own settings file, which is created mode 0600.
-bk_load() { BK_NO_SECRET=1 bk_load_file "$VENDOR_DEFAULTS"; bk_load_file "$BK_CONF"; bk_usable_paths; }
+bk_load() {
+    BK_PASS_PLAIN=""
+    BK_NO_SECRET=1 bk_load_file "$VENDOR_DEFAULTS"; bk_load_file "$BK_CONF"; bk_usable_paths
+    # A password saved in plain text by an older version is rewritten encrypted
+    if [[ -n "$BK_PASS_PLAIN" && -w "$BK_CONF" ]]; then bk_save; fi
+}
+
+# The DB password is stored AES-256 encrypted (DB_PASS_ENC). The key is a random
+# 256-bit value in its own owner-only file next to backup.conf, so the settings file
+# alone - a copy, a backup of /etc, a pasted screenshot - does not reveal the password.
+BK_KEY="$CONF_DIR/backup.key"
+BK_KDF_ITER=10000     # the key is already 256 random bits; settings are read often, so keep it fast
+bk_key_ready() {
+    [[ -s "$BK_KEY" ]] && return 0
+    local tmp
+    mkdir -p -m 700 "$(dirname "$BK_KEY")" 2>/dev/null
+    tmp="$(mktemp "${BK_KEY}.XXXXXX")" || return 1
+    chmod 600 "$tmp"
+    if ! openssl rand -hex 32 >"$tmp" 2>/dev/null || [[ ! -s "$tmp" ]]; then rm -f -- "$tmp"; return 1; fi
+    mv -f -- "$tmp" "$BK_KEY"
+}
+# The plain text goes through a pipe and the key through a file, never the command line (visible in ps)
+bk_encrypt() {
+    bk_key_ready || return 1
+    printf '%s' "$1" | openssl enc -aes-256-cbc -pbkdf2 -iter "$BK_KDF_ITER" -salt -a -A -pass "file:$BK_KEY" 2>/dev/null
+}
+bk_decrypt() {
+    [[ -r "$BK_KEY" ]] || return 1
+    printf '%s\n' "$1" | openssl enc -d -aes-256-cbc -pbkdf2 -iter "$BK_KDF_ITER" -a -A -pass "file:$BK_KEY" 2>/dev/null
+}
 
 # The package defaults point at root-only folders (/var/backups/safetui, or whatever the
 # site set). A normal user cannot write there, and the dump used to fail halfway with a
@@ -1779,10 +1870,17 @@ bk_load_file() {
         case "$k" in
             DB_HOME)      BK_DB_HOME="$v" ;;
             DB_USER)      BK_DB_USER="$v" ;;
-            DB_PASS)      if [[ -n "${BK_NO_SECRET:-}" ]]; then
-                              echo "$(date '+%F %T') $(L 'DB_PASS 는 공용 기본값 파일에서 읽지 않습니다' \
-                                                         'DB_PASS is ignored in the shared defaults file'): $1" >>"$TMP_DIR/notes" 2>/dev/null
-                          else BK_DB_PASS="$v"; fi ;;
+            DB_PASS|DB_PASS_ENC)
+                          if [[ -n "${BK_NO_SECRET:-}" ]]; then
+                              echo "$(date '+%F %T') $(L 'DB 비밀번호는 공용 기본값 파일에서 읽지 않습니다' \
+                                                         'The DB password is ignored in the shared defaults file'): $1" >>"$TMP_DIR/notes" 2>/dev/null
+                          elif [[ "$k" == DB_PASS ]]; then
+                              BK_DB_PASS="$v"; BK_PASS_PLAIN=1     # written before 3.5.1; bk_load encrypts it
+                          elif ! BK_DB_PASS="$(bk_decrypt "$v")"; then
+                              BK_DB_PASS=""
+                              echo "$(date '+%F %T') $(L 'DB 비밀번호를 복호화하지 못했습니다. 백업 설정에서 다시 입력하세요' \
+                                                         'Could not decrypt the DB password. Enter it again in Backup settings'): $BK_KEY" >>"$TMP_DIR/notes" 2>/dev/null
+                          fi ;;
             # 메뉴 입력과 같은 형식 검사. 설정 파일을 손으로 고쳤을 때 이상한 값이 그대로 쓰이지 않게.
             DB_NAME)      [[ -z "$v" || "$v" =~ $BK_DBNAME_RE ]] && BK_DB_NAME="$v" ;;
             DB_DIR)       BK_DB_DIR="$v" ;;
@@ -1838,16 +1936,20 @@ bk_dir_safe() {
     return 0
 }
 
-# Contains the DB password, so save it readable by root only (600)
+# Owner-only (600). The DB password is written encrypted; if it cannot be encrypted
+# nothing is written, so it never ends up in plain text.
 bk_save() {
-    local tmp
+    local tmp enc=""
+    if [[ -n "$BK_DB_PASS" ]]; then
+        enc="$(bk_encrypt "$BK_DB_PASS")" && [[ -n "$enc" ]] || return 1
+    fi
     mkdir -p -m 700 "$(dirname "$BK_CONF")" 2>/dev/null
     tmp="$(mktemp "${BK_CONF}.XXXXXX")" || return 1
     chmod 600 "$tmp"
     {
         printf 'DB_HOME=%s\n'      "$BK_DB_HOME"
         printf 'DB_USER=%s\n'      "$BK_DB_USER"
-        printf 'DB_PASS=%s\n'      "$BK_DB_PASS"
+        printf 'DB_PASS_ENC=%s\n'  "$enc"
         printf 'DB_NAME=%s\n'      "$BK_DB_NAME"
         printf 'DB_DIR=%s\n'       "$BK_DB_DIR"
         printf 'DB_KEEP_DAYS=%s\n' "$BK_DB_KEEP_DAYS"
@@ -1924,10 +2026,16 @@ bk_settings() {
                else msg "$(L '입력 오류' 'Invalid input')" "$(L '계정 이름을 공백 없이 입력하세요.' 'Enter a user name without spaces.')" 8; fi ;;
             3) v="$(dlg --title "$(L 'DB 비밀번호' 'DB password')" --insecure \
                     --passwordbox "$(L '비밀번호를 입력하세요. (입력한 글자는 * 로 표시)\n비밀번호가 없는 계정이면 비워 두고 확인을 누르세요.\n\n저장 위치: ' \
-                                       'Enter the password (shown as *).\nLeave empty if the account has no password.\n\nStored in: ')${BK_CONF} $(L '(root 만 읽기 가능)' '(root-only)')" \
+                                       'Enter the password (shown as *).\nLeave empty if the account has no password.\n\nStored in: ')${BK_CONF} $(L '(AES-256 암호화, 소유자만 읽기 가능)' '(AES-256 encrypted, owner-only)')" \
                     13 "$DLG_W")" || continue
                if [[ "$v" == *$'\n'* ]]; then msg "$(L '입력 오류' 'Invalid input')" "$(L '줄바꿈은 쓸 수 없습니다.' 'Line breaks are not allowed.')" 8
-               else BK_DB_PASS="$v"; bk_save; fi ;;
+               else
+                   BK_DB_PASS="$v"
+                   if ! bk_save; then
+                       msg "$(L '저장 실패' 'Save failed')" "$(L '비밀번호를 암호화하지 못해 저장하지 않았습니다. (openssl 설치 여부 확인)' 'The password could not be encrypted, so it was not saved. (Check that openssl is installed)')\n\n  $BK_KEY" 9
+                       bk_load
+                   fi
+               fi ;;
             4) v="$(dlg_input "$(L '백업할 DB 이름' 'Database name')" \
                     "$(L '덤프할 DB 이름을 입력하세요. 여러 개는 공백으로 구분합니다.\n비워 두면 전체 DB 를 한 파일로 백업합니다.' \
                          'Enter database name(s), separated by spaces.\nLeave empty to dump all databases into one file.')" "$BK_DB_NAME")" || continue
@@ -2231,8 +2339,16 @@ bk_browse() {
 # 첫 줄만 보여 주면 해결 방법이 잘린다. 두 줄까지 결과 화면의 들여쓰기에 맞춰 돌려준다.
 bk_err_text() { awk 'NR<=2 { printf "%s%s", (NR > 1 ? "\\n        " : ""), $0 }' "$TMP_DIR/cp.err"; }
 
+# 0 when both are folders or both are not (a link counts as not a folder)
+bk_same_kind() {
+    local a=f b=f
+    [[ -d "$1" && ! -L "$1" ]] && a=d
+    [[ -d "$2" && ! -L "$2" ]] && b=d
+    [[ "$a" == "$b" ]]
+}
+
 bk_copy_one() {
-    local src="$1" base destdir dest part policy n a b lnk ldir
+    local src="$1" base destdir dest part old policy n a b lnk ldir
     # Defence in depth: whatever the browser allowed, never copy something this
     # account does not own (see bk_may_select).
     if ! bk_may_select "$src"; then
@@ -2276,6 +2392,11 @@ bk_copy_one() {
             number) n=1; while [[ -e "${dest}_$n" || -L "${dest}_$n" || -n "${BK_USED[${dest}_$n]:-}" ]]; do (( n++ )); done
                     dest="${dest}_$n" ;;
         esac
+        # Overwrite only a backup of the same kind: a file never replaces a folder, nor the other way round
+        if [[ "$policy" == overwrite ]] && ! bk_same_kind "$src" "$dest"; then
+            BK_MSG="$(L '실패' 'FAILED')  $src\n        $(L '같은 이름의 다른 종류(파일/폴더)가 있어 덮어쓰지 않았습니다' 'a different kind of item (file/folder) has this name, so it was not overwritten'): $dest"
+            return 1
+        fi
     fi
     # Copy under a temporary name and rename, so a failure never leaves a half-copied backup behind
     part="${dest}.safetui-part.$$"
@@ -2292,11 +2413,21 @@ bk_copy_one() {
             touch -r "${src}${ldir#"$part"}" -- "$ldir" 2>/dev/null
         done < <(find "$part" -type l -print0 2>/dev/null)
     fi
-    if [[ -e "$dest" || -L "$dest" ]]; then rm -rf -- "$dest"; fi
+    # Move the old backup aside and delete it only after the new one is in place
+    old=""
+    if [[ -e "$dest" || -L "$dest" ]]; then
+        old="${dest}.safetui-old.$$"
+        if ! mv -T -- "$dest" "$old" 2>"$TMP_DIR/cp.err"; then
+            rm -rf -- "$part"
+            BK_MSG="$(L '실패' 'FAILED')  $src\n        $(bk_err_text)"; return 1
+        fi
+    fi
     if ! mv -T -- "$part" "$dest" 2>"$TMP_DIR/cp.err"; then
         rm -rf -- "$part"
+        [[ -n "$old" ]] && mv -T -- "$old" "$dest" 2>/dev/null
         BK_MSG="$(L '실패' 'FAILED')  $src\n        $(bk_err_text)"; return 1
     fi
+    [[ -n "$old" ]] && rm -rf -- "$old"
     BK_USED["$dest"]=1
     a="$(stat -c '%U:%G %a' -- "$src" 2>/dev/null)"; b="$(stat -c '%U:%G %a' -- "$dest" 2>/dev/null)"
     BK_MSG="$(L '완료' 'OK')    $src\n     →  $dest\n        $(L '소유자·권한' 'owner/mode'): $b"

@@ -1,5 +1,5 @@
 Name:           safetui
-Version:        3.5.0
+Version:        3.5.1
 Release:        1%{?dist}
 Summary:        Menu-driven firewall, SELinux, lockout guard and backup tool
 
@@ -23,6 +23,8 @@ Requires:       findutils
 Requires:       gzip
 Requires:       tar
 Requires:       util-linux
+# AES-256 encryption of the saved DB password
+Requires:       openssl
 # safetui-guard: nft, systemd-run, who/ps for terminal notices
 Requires:       procps-ng
 Requires:       nftables
@@ -79,6 +81,19 @@ fi
 %dir %attr(0700,root,root) %{_sharedstatedir}/safetui-guard
 
 %changelog
+* Mon Oct 26 2026 JJ <mrwhitehacker@naver.com> - 3.5.1-1
+- The DB password is stored AES-256 encrypted (DB_PASS_ENC) with a random
+  256-bit key in its own owner-only file (backup.key). A plain-text password
+  saved by an older version is encrypted the next time the settings are read.
+  If encryption is not possible nothing is written. Requires openssl.
+- Overwriting a backup no longer deletes first: the old backup is moved aside
+  and removed only after the new one is in place, and restored if the rename
+  fails. A file never overwrites a folder of the same name, nor the reverse.
+- A failed firewall reload is reported as a failure, with its output on top.
+  Before, the screen said OK although the running firewall was not updated.
+- IP / CIDR input is validated as a real IPv4 / IPv6 address with a prefix
+  in range (/0-32, /0-128), not only by its characters.
+
 * Fri Oct 23 2026 JJ <mrwhitehacker@naver.com> - 3.5.0-1
 - Security hardening after an external review (findings S15-S24):
   - safetui-guard: __rollback / __warn now require root; do_rollback only
